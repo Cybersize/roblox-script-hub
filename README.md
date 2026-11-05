@@ -14,17 +14,25 @@ The loader reads `manifest.json`, detects `game.PlaceId`, and loads only that ga
 
 | Place ID | Script | Features |
 | --- | --- | --- |
-| `129852792970565` | [Egg Collector · Tween Return](games/129852792970565.luau) | Multi-select rarities, highest-rarity priority, empty-handed teleport/pickup and adjustable tween-to-bank |
+| `129852792970565` | [Egg Collector · Return Modes](games/129852792970565.luau) | Multi-select rarities, highest-rarity priority, six return modes and adjustable tween speed/timing/distance |
 | `104432981439032` | [Restaurant Remote Auto Play](games/104432981439032.luau) | Remote-only seat assignment, orders, cooking/collecting, serving, table clearing and dishwashing; no character movement |
 
 **RightShift** hides/shows either menu. The restaurant script starts stopped; press **Start all** to enable its duties. Cooking uses the game's normal timers. Ingredient farming, purchases, spawning customers and staff configuration are not included.
 
-### Egg collector (1.1.1)
+### Egg collector (1.2.0)
 
 - Select multiple rarities. **Highest rarity first** is the default; eggs of equal rarity are ordered by distance. Empty selection targets nothing. **Nearest selected** is also available.
-- An egg pickup is acknowledged through the player's `CarryingEgg` attribute before returning. Instant teleport buttons are blocked while carrying, including the previous-position button.
-- Automatic and manual returns both tween to the fixed endpoint `Vector3.new(-208.12997436523438, 4.237678050994873, 399.94561767578125)`, not the saved origin. A bank acknowledgement does not stop the tween short of that endpoint. A successful return still requires the local player's `EggBanked` server event and cleared carry state; clearing `CarryingEgg` alone is not reported as success. Cancellation, corrections and rejections can still stop a return.
-- **Tween & selection → Match carry speed** defaults to 90% of the current Humanoid.WalkSpeed. Choose **Custom speed (may reset)** to use the 10–250 studs/second slider for a faster tween. The script does not change WalkSpeed, collision, anchoring or network settings. Server checks may still reject a tween, especially at higher speeds; this is not a guaranteed reset bypass.
+- An egg pickup is acknowledged through the player's `CarryingEgg` attribute before returning. Ordinary travel and previous-position buttons remain empty-handed only. Experimental return modes explicitly allow one carried-egg teleport and may reset the egg.
+- Choose **Return mode** on the Eggs tab:
+  1. **Tween only** — default; no return teleport.
+  2. **Tween until bank confirmed, then teleport** — teleport only after your own `EggBanked` event and cleared carry state.
+  3. **Timed tween → teleport (may reset)** — tween for a chosen delay, then teleport once.
+  4. **Tween near target → teleport (may reset)** — tween until within a chosen remaining distance, then teleport once.
+  5. **Instant return (may reset)** — one immediate return teleport.
+  6. **Manual / no automatic return** — pick up, but leave the return to you.
+- **Return options** provides the timed delay (0.25–10 seconds, default 1) and near-target distance (1–200 studs, default 12), plus Return current egg and Stop controls. Mode/timing/distance changes apply to the next return. To switch an active return, Stop it, choose a mode, then press Return current egg.
+- Every automatic return mode and the Return current egg button share the fixed endpoint `Vector3.new(-208.12997436523438, 4.237678050994873, 399.94561767578125)`. A successful return requires the local player's `EggBanked` event, cleared carry state and arrival at the endpoint. A teleport or cleared carry state alone is not reported as success. Cancellation, corrections and rejections can still stop a return. Teleports are never spammed/retried inside an action.
+- **Speed & selection → Match carry speed** defaults to 90% of the current Humanoid.WalkSpeed. Choose **Custom speed (may reset)** to use the 10–250 studs/second slider for a faster tween. The script does not change WalkSpeed, collision, anchoring or network settings. Server checks may reject fast tweens or carried-egg teleports; none of these modes is a guaranteed reset bypass.
 - Slips, guard catches, rejection-counter increases, blocked movement and unconfirmed banks pause auto-collect. **Stop current action** and **Unload** cancel an active tween.
 
 Default rarity order: Divine → Super Secret → Secret → Ascendant → Exotic → Relic → Mythic → Legendary → Epic → Rare → Common. Exclusive is paid-only and is not included among world-spawn eggs.
@@ -56,7 +64,7 @@ Game scripts should default to stopped, guard their supported place IDs, stop th
 
 ## Validation status
 
-All three Luau files compiled successfully. The universal loader passed 17 isolated routing/error-handling checks without executing gameplay. Isolated game-logic tests also passed (33 egg 1.1.1 policy/selection/tween checks and 31 restaurant planner checks). The restaurant planner selected a valid task from the live state in read-only mode. End-to-end live gameplay, including server acceptance of the new tween return, has not been verified.
+All three Luau files compiled successfully. The universal loader passed 17 isolated routing/error-handling checks without executing gameplay. Isolated game-logic tests also passed (57 egg 1.2.0 policy/selection/return-mode checks and 31 restaurant planner checks). The restaurant planner selected a valid task from the live state in read-only mode. End-to-end live gameplay, including server acceptance of the new return modes, has not been verified.
 
 The 1.1.0 restaurant update additionally passed 10 mocked remote-transport checks covering all eight job methods and rejection/error propagation. Static checks confirm that the restaurant script contains no character-movement or simulated-signal calls. These checks do not establish whether a server accepts a distant task.
 

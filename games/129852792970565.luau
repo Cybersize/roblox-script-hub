@@ -1,10 +1,11 @@
--- Egg teleport / pickup / tween-to-bank for Place 129852792970565 (1.1.1).
+-- Egg collector / selectable return modes for Place 129852792970565 (1.2.0).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
 -- No purchase/admin remotes are used. Pickup must be accepted by the server.
--- Empty-handed teleports only. Carry return is an adjustable linear tween,
--- not a guaranteed server-check bypass. No speed stats/physics flags are changed.
+-- Normal teleport buttons require empty hands. Explicit experimental return
+-- modes may teleport a held egg and can cause a server reset; they are not bypasses.
+-- Tween-only remains the default. No speed stats/physics flags are changed.
 
 local PLACE_ID = 129852792970565
 if game.PlaceId ~= PLACE_ID then
@@ -40,11 +41,12 @@ end
 
 local state = {
     alive = true, busy = false, auto = false, epoch = 0, carryLock = false,
-    rarities = table.clone(RARITIES), priority = "Highest rarity first", tweenAfter = true, saved = nil,
+    rarities = table.clone(RARITIES), priority = "Highest rarity first", returnMode = "tween", saved = nil,
+    snapAfter = 1, snapDistance = 12,
     speedMode = "Match carry speed", customSpeed = 100,
     banks = 0, slips = 0, fault = nil,
 }
-local app, statusLabel, countLabel, activePrompt, activeTween, autoToggle, speedSlider
+local app, statusLabel, countLabel, activePrompt, activeTween, autoToggle, speedSlider, returnDelaySlider, returnDistanceSlider
 local connections = {}
 local lifetime = Instance.new("BindableFunction")
 lifetime.Name = LIFETIME_NAME
@@ -114,6 +116,19 @@ function ReturnPolicy.result(expected, currentId, banks, bankBaseline, slips, sl
     if banks > bankBaseline and (currentId == nil or currentId == "") then return "banked" end
     if currentId == expected then return "carrying" end
     return "unconfirmed"
+end
+function ReturnPolicy.shouldSnap(mode, elapsed, remaining, bankConfirmed, delay, distance)
+    if mode == "banked" then return bankConfirmed end
+    if mode == "timed" then return elapsed >= delay end
+    if mode == "near" then return remaining <= distance end
+    return mode == "instant"
+end
+function ReturnPolicy.allowSnap(mode, expectedId, currentId, bankConfirmed)
+    local hasEgg = type(currentId) == "string" and currentId ~= ""
+    if hasEgg and currentId ~= expectedId then return false end
+    if mode == "banked" then return bankConfirmed and not hasEgg end
+    local experimental = mode == "timed" or mode == "near" or mode == "instant"
+    return experimental and (currentId == expectedId or bankConfirmed and not hasEgg)
 end
 -- RETURN_POLICY_END
 
@@ -191,7 +206,7 @@ end
 
 local function moveRoot(root, destination)
     if not ReturnPolicy.canTeleport(player:GetAttribute("CarryingEgg"), state.carryLock) then
-        return false, "Instant teleport blocked while holding an egg. Use tween-to-bank."
+        return false, "This teleport button requires empty hands. Use the selected return mode instead."
     end
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
@@ -204,41 +219,77 @@ local function bankDestination()
     return Vector3.new(-208.12997436523438, 4.237678050994873, 399.94561767578125)
 end
 
+local function teleportReturn(id, root, current, mode, bankConfirmed)
+    if not current() then return false, "Return cancelled." end
+    if not ReturnPolicy.allowSnap(mode, id, player:GetAttribute("CarryingEgg"), bankConfirmed) then
+        return false, "Teleport not authorized by this return mode/carry state."
+    end
+    cancelTween()
+    local rotation = root.CFrame - root.Position
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    root.CFrame = CFrame.new(bankDestination()) * rotation
+    return true
+end
+
 local function tweenToBank(id, root, humanoid, current)
+    local mode = state.returnMode or "tween"
+    if mode == "manual" then return false, "Manual return selected; choose another mode to use this button." end
     local goal = bankDestination()
     local bankBaseline, slipBaseline = state.banks, state.slips
     local rejectBaseline = tonumber(player:GetAttribute("RejectCount")) or 0
-    local deadline, clearedAt, bankConfirmed = os.clock() + 180, nil, false
+    local started = os.clock()
+    local snapAfter, snapDistance = state.snapAfter or 1, state.snapDistance or 12
+    local deadline, clearedAt, bankConfirmed = started + 180, nil, false
+    local snapped, snappedAt = false, nil
     while current() and os.clock() < deadline do
         local currentId = player:GetAttribute("CarryingEgg")
         local result = ReturnPolicy.result(id, currentId, state.banks, bankBaseline, state.slips,
             slipBaseline, tonumber(player:GetAttribute("RejectCount")) or 0, rejectBaseline)
         if result == "banked" then bankConfirmed = true end
-        if result == "rejected" then cancelTween(); return false, "Server rejected the return. Auto paused; reduce tween speed or return manually." end
-        if not bankConfirmed and (result == "unconfirmed" or state.banks > bankBaseline) then
+        if result == "rejected" then
+            cancelTween()
+            return false, "Server rejected the return. Auto paused; change return mode/speed or return manually."
+        end
+        local remaining = (goal - root.Position).Magnitude
+        if bankConfirmed and remaining < 0.15 then
+            cancelTween(); return true, "Bank confirmed; fixed return destination reached."
+        end
+        if snapped then
+            -- Never repeatedly snap or tween after an unconfirmed teleport.
+            if os.clock() - snappedAt > 3 then
+                return false, "Teleport return was not confirmed at the destination. Auto paused."
+            end
+            task.wait(0.05)
+        elseif not bankConfirmed and (result == "unconfirmed" or state.banks > bankBaseline) then
             cancelTween()
             clearedAt = clearedAt or os.clock()
             if os.clock() - clearedAt > 3 then
                 return false, "Carry state changed without a complete bank confirmation. Auto paused."
             end
             task.wait(0.05)
+        elseif ReturnPolicy.shouldSnap(mode, os.clock() - started, remaining, bankConfirmed, snapAfter, snapDistance) then
+            local ok, message = teleportReturn(id, root, current, mode, bankConfirmed)
+            if not ok then return false, message end
+            snapped, snappedAt = true, os.clock()
+            status("Return teleported once; waiting for bank acknowledgement and destination confirmation.")
+            task.wait(0.05)
+        elseif remaining < 0.15 then
+            cancelTween()
+            local untilTime = os.clock() + 3
+            repeat
+                if not current() then return false, "Return cancelled." end
+                if state.banks > bankBaseline and not carrying() then
+                    return true, "Bank confirmed; fixed return destination reached."
+                end
+                if state.slips > slipBaseline then return false, "Egg slipped back; auto paused." end
+                task.wait(0.05)
+            until os.clock() >= untilTime
+            return false, "Reached the destination, but the server did not confirm a bank. Auto paused."
         else
             clearedAt = nil
             local speed = ReturnPolicy.speed(state.customSpeed, humanoid.WalkSpeed, state.speedMode == "Match carry speed")
             if not speed then return false, "Carry speed is zero; tween stopped." end
-            local remaining = (goal - root.Position).Magnitude
-            if remaining < 0.15 then
-                cancelTween()
-                if bankConfirmed then return true, "Bank confirmed; fixed tween destination reached." end
-                local untilTime = os.clock() + 3
-                repeat
-                    if not current() then return false, "Return cancelled." end
-                    if state.banks > bankBaseline and not carrying() then return true, "Bank confirmed; fixed tween destination reached." end
-                    if state.slips > slipBaseline then return false, "Egg slipped back; auto paused." end
-                    task.wait(0.05)
-                until os.clock() >= untilTime
-                return false, "Reached the bank area, but the server did not confirm a bank. Auto paused."
-            end
             local origin = root.Position
             local nextPoint = origin:Lerp(goal, math.min(1, 24 / remaining))
             local direction = Vector3.new(goal.X - nextPoint.X, 0, goal.Z - nextPoint.Z)
@@ -247,24 +298,28 @@ local function tweenToBank(id, root, humanoid, current)
             local tween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear),
                 {CFrame = CFrame.lookAt(nextPoint, nextPoint + direction)})
             activeTween = tween
-            status(string.format("Tweening to bank: %.1f studs/s%s", speed,
-                state.speedMode == "Match carry speed" and " (carry-speed cap)" or " (custom; may reset)"))
+            status(string.format("Return mode %s: tween %.1f studs/s", mode, speed))
             tween:Play()
-            local expires = os.clock() + duration + 1
+            local expires, switchToSnap = os.clock() + duration + 1, false
             while current() and os.clock() < expires and tween.PlaybackState ~= Enum.PlaybackState.Completed do
                 local bankCleared = state.banks > bankBaseline and not carrying()
                 if (not bankCleared and (player:GetAttribute("CarryingEgg") ~= id or state.banks > bankBaseline))
                     or state.slips > slipBaseline
                     or (tonumber(player:GetAttribute("RejectCount")) or 0) > rejectBaseline then break end
+                if ReturnPolicy.shouldSnap(mode, os.clock() - started, (goal - root.Position).Magnitude,
+                    bankCleared, snapAfter, snapDistance) then
+                    switchToSnap = true
+                    break
+                end
                 task.wait(0.05)
             end
             cancelTween()
             if not current() then return false, "Return cancelled." end
-            if (bankConfirmed or player:GetAttribute("CarryingEgg") == id)
+            if not switchToSnap and (bankConfirmed or player:GetAttribute("CarryingEgg") == id)
                 and state.slips == slipBaseline
                 and (tonumber(player:GetAttribute("RejectCount")) or 0) <= rejectBaseline
                 and (root.Position - nextPoint).Magnitude > 6 then
-                return false, "Tween was blocked or corrected. Auto paused; no snap-back retry was attempted."
+                return false, "Tween was blocked or corrected. Auto paused; no automatic snap retry was attempted."
             end
         end
     end
@@ -275,12 +330,12 @@ end
 local function runAction(collect)
     if not state.alive or state.busy then return end
     if carrying() or state.carryLock then
-        status("Holding an egg: instant teleports are blocked. Use Tween current egg to bank.")
+        status("Holding an egg: use Return current egg to bank with your selected return mode.")
         return
     end
     local character, root, humanoid = characterParts()
     if not root then status("Waiting for a living character."); return end
-    if collect and state.tweenAfter and not state.bankSensor then
+    if collect and state.returnMode ~= "manual" and not state.bankSensor then
         status("Bank feedback remote is not ready. Retry after the game loads."); return
     end
     local egg, prompt = findEgg()
@@ -340,8 +395,8 @@ local function runAction(collect)
             until os.clock() >= deadline
             if not received then status("Pickup not confirmed by server; check eligibility or try again."); return end
             state.carryLock = true
-            status("Picked up " .. rarity .. " egg. No instant return will run.")
-            if state.tweenAfter and current() then
+            status("Picked up " .. rarity .. " egg. Return mode: " .. state.returnMode .. ".")
+            if state.returnMode ~= "manual" and current() then
                 local banked, result = tweenToBank(id, root, humanoid, current)
                 if banked then status(result) elseif current() then pauseAuto(state.fault or result) end
             end
@@ -352,7 +407,7 @@ local function runAction(collect)
         state.busy = false
         if not ok then
             warn("[Egg Teleport] " .. tostring(reason))
-            pauseAuto("Action failed. See executor console. No instant carry return was attempted.")
+            pauseAuto("Action failed. Auto paused; see executor console.")
         elseif state.fault then
             status(state.fault)
         end
@@ -361,6 +416,7 @@ end
 
 local function tweenHeldEgg()
     if not state.alive or state.busy then return end
+    if state.returnMode == "manual" then status("Manual return selected. Choose another return mode first."); return end
     local id = player:GetAttribute("CarryingEgg")
     local character, root, humanoid = characterParts()
     if not carrying() or not root then status("No held egg / living character."); return end
@@ -384,7 +440,7 @@ local function tweenHeldEgg()
 end
 
 local window = app:CreateWindow({
-    Id = "eggs", Title = "Egg Collector · Tween Return", Design = "MintGlass",
+    Id = "eggs", Title = "Egg Collector · Return Modes", Design = "MintGlass",
     Size = { 640, 620 }, OpenKey = "RightShift", Wallpaper = false,
     OnClose = cleanup,
 })
@@ -408,10 +464,23 @@ section:AddDropdown({Id = "priority", Title = "Priority", Default = "Highest rar
 countLabel = section:AddText({ Text = "Available matching eggs: 0" })
 statusLabel = section:AddParagraph({ Text = "Status: Ready." })
 section:AddButton({ Title = "Teleport to best selected egg (empty hands)", Callback = function() runAction(false) end })
-section:AddButton({ Title = "Get egg + tween to bank", Variant = "primary", Callback = function() runAction(true) end })
-section:AddToggle({
-    Id = "tweenReturn", Title = "Tween to bank after pickup", Default = true,
-    Callback = function(value) state.tweenAfter = value end,
+section:AddButton({ Title = "Get egg + selected return", Variant = "primary", Callback = function() runAction(true) end })
+section:AddDropdown({
+    Id = "returnMode", Title = "Return mode", Default = "tween",
+    Options = {
+        {value = "tween", label = "Tween only (default)"},
+        {value = "banked", label = "Tween until bank confirmed, then teleport"},
+        {value = "timed", label = "Timed tween → teleport (may reset)"},
+        {value = "near", label = "Tween near target → teleport (may reset)"},
+        {value = "instant", label = "Instant return (may reset)"},
+        {value = "manual", label = "Manual / no automatic return"},
+    },
+    Callback = function(value)
+        state.returnMode = value
+        if returnDelaySlider then returnDelaySlider:Update({Disabled = value ~= "timed"}) end
+        if returnDistanceSlider then returnDistanceSlider:Update({Disabled = value ~= "near"}) end
+        status("Return mode for the next return: " .. value .. ". Stop + Return current egg to switch an active action.")
+    end,
 })
 autoToggle = section:AddToggle({
     Id = "auto", Title = "Auto collect selected rarities", Default = false,
@@ -419,13 +488,30 @@ autoToggle = section:AddToggle({
         state.auto = value
         state.epoch = state.epoch + 1
         if value then state.fault = nil else cancelTween(); endHold() end
-        status(value and ("Auto enabled; priority: " .. state.priority .. ".") or "Auto stopped. No instant return will run.")
+        status(value and ("Auto enabled; priority: " .. state.priority .. ".") or "Auto stopped; active return cancelled.")
     end,
 })
-section:AddParagraph({Text = "Teleport is only used while empty-handed. Both return controls target the fixed position (-208.130, 4.238, 399.946), never your saved origin. RightShift toggles this menu."})
+section:AddParagraph({Text = "Normal teleport buttons require empty hands. Return mode selects how a held egg is returned; experimental teleport modes may reset it. All return modes use (-208.130, 4.238, 399.946). RightShift toggles this menu."})
 section:AddButton({Title = "Unload", Callback = cleanup})
 
-local settings = window:AddTab({Title = "Tween & selection"}):AddSection({Title = "Return speed"})
+local returnSettings = window:AddTab({Title = "Return options"}):AddSection({Title = "Hybrid timing & distance"})
+returnDelaySlider = returnSettings:AddSlider({Id = "snapAfter", Title = "Timed mode: tween seconds before teleport",
+    Min = 0.25, Max = 10, Step = 0.25, Default = 1, Disabled = true,
+    Callback = function(value) state.snapAfter = value end})
+returnDistanceSlider = returnSettings:AddSlider({Id = "snapDistance", Title = "Near-target mode: teleport within studs",
+    Min = 1, Max = 200, Step = 1, Default = 12, Disabled = true,
+    Callback = function(value) state.snapDistance = value end})
+returnSettings:AddParagraph({Text = "Timed mode tweens for the chosen delay, then teleports once. Near-target mode tweens until close enough, then teleports once. Both can teleport a held egg and trigger resets. Bank-confirmed mode never teleports until your own bank event and cleared carry state are observed. Mode/timing changes apply to the next return."})
+returnSettings:AddButton({Title = "Return current egg to bank", Callback = tweenHeldEgg})
+returnSettings:AddButton({Title = "Stop current action", Callback = function()
+    state.epoch = state.epoch + 1
+    autoToggle:SetValue(false)
+    cancelTween(); endHold()
+    status("Action stopped. No further tween/teleport requests will run for this action.")
+end})
+returnSettings:AddParagraph({Text = "Fixed target: X=-208.12997436523438, Y=4.237678050994873, Z=399.94561767578125. A teleport is not counted as a bank unless the server confirms it. Rejected teleports are never spammed or automatically retried."})
+
+local settings = window:AddTab({Title = "Speed & selection"}):AddSection({Title = "Tween speed"})
 settings:AddDropdown({Id = "speedMode", Title = "Tween speed mode", Default = "Match carry speed",
     Options = {"Match carry speed", "Custom speed (may reset)"}, Callback = function(value)
         state.speedMode = value
@@ -435,7 +521,6 @@ speedSlider = settings:AddSlider({Id = "customSpeed", Title = "Custom tween spee
     Min = 10, Max = 250, Step = 5, Default = 100, Disabled = true,
     Callback = function(value) state.customSpeed = value end})
 settings:AddParagraph({Text = "Match carry speed uses 90% of the current Humanoid.WalkSpeed. Custom mode can be faster, but the server may still reset the egg. No carry speed, collision, anchoring or network settings are changed. Auto pauses on a reset or an unconfirmed bank."})
-settings:AddButton({Title = "Tween current egg to bank", Callback = tweenHeldEgg})
 settings:AddButton({ Title = "Return previous position (empty hands only)", Callback = function()
     if state.busy then return end
     local _, root = characterParts()
@@ -444,12 +529,6 @@ settings:AddButton({ Title = "Return previous position (empty hands only)", Call
         if not ok then status(reason) end
     end
 end })
-settings:AddButton({Title = "Stop current action", Callback = function()
-    state.epoch = state.epoch + 1
-    autoToggle:SetValue(false)
-    cancelTween(); endHold()
-    status("Action stopped. Held eggs are not teleported or dropped.")
-end})
 settings:AddButton({Title = "Select all rarities", Callback = function() raritySelect:SetValue(table.clone(RARITIES)) end})
 settings:AddButton({Title = "Clear rarity selection", Callback = function() raritySelect:SetValue({}) end})
 
@@ -462,7 +541,7 @@ if effects and effects:IsA("RemoteEvent") then
         if payload.key == "EggBanked" then state.banks = state.banks + 1
         elseif payload.key == "GuardCatch" and state.busy then
             state.slips = state.slips + 1
-            pauseAuto("Guard caught you. Auto paused; no instant return will run.")
+            pauseAuto("Guard caught you. Auto paused and active return cancelled.")
         end
     end)
 end
