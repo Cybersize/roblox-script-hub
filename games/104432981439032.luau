@@ -1,6 +1,7 @@
--- Restaurant Auto Play / MattLib
+-- Restaurant Remote Auto Play / MattLib (1.1.0)
 -- For Place 104432981439032. Written from the supplied place snapshot.
 -- Uses the same entity actions as the game's interaction controllers.
+-- Remote-only: never teleports, walks, changes physics, or fakes GUI signals.
 -- Does not buy items, change staff settings, spawn customers, or skip cooking timers.
 -- All automation starts OFF. Use Start all after the restaurant finishes loading.
 
@@ -15,8 +16,8 @@ local playerGui = player:WaitForChild("PlayerGui")
 local sharedFolder = assert(ReplicatedStorage:WaitForChild("Shared",20), "Game modules not loaded.")
 local client = assert(sharedFolder:WaitForChild("Client",20), "Game client modules not loaded.")
 local ClientRestaurant = require(client:WaitForChild("ClientRestaurant",20))
+local Network = require(client:WaitForChild("Network",20))
 local CustomerTypes = require(sharedFolder.Domain.Directory.Entity.CustomerTypes)
-local ClientStove = require(client.ClientEntity.ClientStove)
 
 local URL = "https://raw.githubusercontent.com/Cybersize/MattLib/81feb71431f2e8ce6aba74c9a8d179c9c74cbf7f/dist/MattLib.lua"
 local downloaded, source = pcall(function() return game:HttpGet(URL) end)
@@ -199,7 +200,7 @@ end)()
 
 local state = {
     alive=true, enabled=false, busy=false, inFlight=false, epoch=0,
-    movement="Teleport", interval=0.75, nextAction=0, cooldowns={}, accepted=0, confirmed=0, rejected=0,
+    interval=0.75, nextAction=0, cooldowns={}, accepted=0, confirmed=0, rejected=0,
     features={assign=true,orders=true,cook=true,serve=true,clean=true,wash=true},
 }
 local app, statusLabel, totalsLabel, summaryLabel
@@ -214,7 +215,7 @@ end
 local function setEnabled(value)
     state.enabled=value
     state.epoch=state.epoch+1
-    status(value and "Running." or (state.inFlight and "Stopped. An already-sent server call is still pending." or "Stopped."))
+    status(value and "Running — remote calls only." or (state.inFlight and "Stopped. An already-sent server call is still pending." or "Stopped."))
 end
 local function cleanup()
     if state.alive then
@@ -240,11 +241,10 @@ local function context()
     return {rest=rest,player=player,status=CustomerTypes.Status,features=state.features,
         cooldowns=state.cooldowns,now=os.clock()}
 end
-local function characterParts()
+local function livingCharacter()
     local character=player.Character
-    local root=character and character:FindFirstChild("HumanoidRootPart")
     local humanoid=character and character:FindFirstChildOfClass("Humanoid")
-    if root and humanoid and humanoid.Health>0 then return character,root,humanoid end
+    if humanoid and humanoid.Health>0 then return character,humanoid end
 end
 local function refreshTotals()
     if not state.alive then return end
@@ -266,66 +266,32 @@ local function refreshTotals()
     summaryLabel:Update({Text=string.format("Queue: %d | Need orders: %d | Tickets: %d | Ready food: %d | Dirty seats: %d",queued,orders,tickets,ready,dirty)})
 end
 
-local function approach(ctx,plan,root,humanoid,isCurrent)
-    local entity=plan.entity
-    local faceVoxel=entity:GetFaceVoxel()
-    if plan.slot then
-        faceVoxel=entity:GetFaceVoxel(ClientStove.ComputeSlotVoxel(entity,plan.slot))
-    end
-    local floor=entity:GetFloor()
-    local ground=ctx.rest:ComputeVoxelCFrame(faceVoxel,floor).Position
-    local target=ctx.rest:ComputeEntityCFrame(entity).Position
-    if entity:IsSubclass("Customer") then
-        local model=entity:GetModel()
-        if not model or not model.PrimaryPart then return false,"Customer model not replicated yet." end
-        target=model.PrimaryPart.Position
-        ground=Vector3.new(target.X,ground.Y,target.Z)+model.PrimaryPart.CFrame.RightVector*3
-    end
-    local height=humanoid.HipHeight+root.Size.Y*0.5
-    local position=ground+Vector3.new(0,height,0)
-    local look=Vector3.new(target.X,position.Y,target.Z)
-    if (look-position).Magnitude<0.05 then look=position+Vector3.new(0,0,-1) end
-    if state.movement=="Teleport" then
-        if not isCurrent() then return false,"Cancelled." end
-        humanoid.Sit=false
-        root.AssemblyLinearVelocity=Vector3.zero
-        root.AssemblyAngularVelocity=Vector3.zero
-        root.CFrame=CFrame.lookAt(position,look)
-        task.wait(0.35)
-    end
-    if not isCurrent() then return false,"Cancelled." end
-    -- The order-stand controller uses 11 studs; stay conservatively inside it.
-    local near=(root.Position-position).Magnitude<=5
-    if not near then return false,"Move closer or enable Teleport movement." end
-    return true
+local function invokeJob(plan)
+    -- The game resolves/caches and may rename its remotes. Reuse its transport.
+    -- Network.Invoke routes this RemoteFunction to InvokeServer with these args.
+    return Network.Invoke("Entity_Invoke",plan.entity:GetId(),plan.method,table.unpack(plan.args))
 end
 
 local function runNext()
     if not state.alive or state.busy then return end
     local ctx=context()
     if not ctx then status("Waiting for your own restaurant."); return end
-    local character,root,humanoid=characterParts()
-    if not root then status("Waiting for a living character."); return end
+    local character,humanoid=livingCharacter()
+    if not character then status("Waiting for a living character."); return end
     local plan,note=Core.next(ctx)
     if not plan then status(note); return end
     state.busy=true
     local epoch=state.epoch
     local function isCurrent()
         return state.alive and state.epoch==epoch and player.Character==character
-            and root.Parent==character and humanoid.Health>0
+            and humanoid.Parent==character and humanoid.Health>0
             and ClientRestaurant.GetLocal()==ctx.rest and not ctx.rest:WasDestroyed()
             and ctx.rest:GetOwnerUserId()==player.UserId
     end
     task.spawn(function()
         local ok,reason=xpcall(function()
             if not isCurrent() then return end
-            status(plan.label .. "...")
-            local reached,message=approach(ctx,plan,root,humanoid,isCurrent)
-            if not reached then
-                state.cooldowns[plan.key]=os.clock()+2
-                if isCurrent() then status(message) end
-                return
-            end
+            status("Remote: " .. plan.label .. "...")
             if not isCurrent() or not state.features[plan.feature] or not Core.valid(ctx,plan) then return end
             state.cooldowns[plan.key]=os.clock()+2
             state.inFlight=true
@@ -335,9 +301,7 @@ local function runNext()
                     status("Server call pending: " .. plan.label .. ". No duplicate request will be sent.")
                 end
             end)
-            local invoked,accepted,response=pcall(function()
-                return plan.entity:Invoke(plan.method,table.unpack(plan.args))
-            end)
+            local invoked,accepted,response=pcall(invokeJob,plan)
             settled=true
             state.inFlight=false
             if invoked and accepted==true then
@@ -372,7 +336,7 @@ local function runNext()
     end)
 end
 
-local window=app:CreateWindow({Id="restaurant",Title="Restaurant Auto Play",Design="MintGlass",
+local window=app:CreateWindow({Id="restaurant",Title="Restaurant Remote Auto Play",Design="MintGlass",
     Size={680,550},OpenKey="RightShift",Wallpaper=false,OnClose=cleanup})
 local main=window:AddTab({Title="Auto play"}):AddSection({Title="Control"})
 statusLabel=main:AddParagraph({Text="Status: Stopped. Load your restaurant, then press Start all."})
@@ -389,7 +353,7 @@ end})
 main:AddButton({Title="Run next task once",Callback=function()
     if state.enabled then status("Stop Auto play before running a single task.") else runNext() end
 end})
-main:AddParagraph({Text="Only your own restaurant is handled. Cooking uses the normal server timer. Stop cancels future actions; requests already sent to the server may still finish. RightShift hides/shows this menu."})
+main:AddParagraph({Text="Remote-only: your character is never moved. Only your own restaurant is handled. Cooking uses the normal server timer. Stop cancels future actions; already-sent requests may still finish. RightShift hides/shows this menu."})
 
 local tasks=window:AddTab({Title="Tasks"}):AddSection({Title="Choose duties"})
 controls.features={}
@@ -402,12 +366,11 @@ for _,spec in ipairs({
     controls.features[key]=tasks:AddToggle({Id=key,Title=title,Default=true,Callback=function(value) state.features[key]=value end})
 end
 tasks:AddParagraph({Text="Carried food and dirty dishes are finished before starting another task. While your stove cooks, seat assignment and order taking may continue. To complete a full cycle, leave Cook, Serve, Clear and Wash enabled."})
-local settings=window:AddTab({Title="Settings"}):AddSection({Title="Movement & pace"})
-settings:AddDropdown({Id="movement",Title="Movement",Options={"Teleport","Nearby only"},Default="Teleport",
-    Callback=function(value) state.movement=value end})
+local settings=window:AddTab({Title="Settings"}):AddSection({Title="Remote-only & pace"})
+settings:AddParagraph({Text="Transport: Entity_Invoke RemoteFunction. No teleporting, walking, physics changes, proximity-prompt firing or GUI signal simulation."})
 settings:AddSlider({Id="interval",Title="Pause between actions (seconds)",Min=0.5,Max=3,Step=0.25,Default=0.75,
     Callback=function(value) state.interval=value end})
-settings:AddParagraph({Text="Nearby only never moves your character. Rejections such as staff-claimed orders, occupied seats, missing ingredients or full sinks are shown in Status and backed off rather than spammed. This script does not farm ingredients or hire/configure staff."})
+settings:AddParagraph({Text="Server validation still applies, including any distance checks. Rejections such as out-of-range tasks, staff-claimed orders, occupied seats, missing ingredients or full sinks are shown in Status and backed off rather than spammed. No ingredient farming or staff configuration is included."})
 settings:AddButton({Title="Unload",Callback=cleanup})
 connections[#connections+1]=player.CharacterAdded:Connect(function()
     state.epoch=state.epoch+1

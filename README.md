@@ -15,9 +15,13 @@ The loader reads `manifest.json`, detects `game.PlaceId`, and loads only that ga
 | Place ID | Script | Features |
 | --- | --- | --- |
 | `129852792970565` | [Egg Teleport](games/129852792970565.luau) | Rarity selection, nearest-egg teleport/pickup, optional auto-collect and return |
-| `104432981439032` | [Restaurant Auto Play](games/104432981439032.luau) | Seat assignment, orders, cooking/collecting, serving, table clearing and dishwashing |
+| `104432981439032` | [Restaurant Remote Auto Play](games/104432981439032.luau) | Remote-only seat assignment, orders, cooking/collecting, serving, table clearing and dishwashing; no character movement |
 
 **RightShift** hides/shows either menu. The restaurant script starts stopped; press **Start all** to enable its duties. Cooking uses the game's normal timers. Ingredient farming, purchases, spawning customers and staff configuration are not included.
+
+### Restaurant remote-only mode (1.1.0)
+
+Restaurant jobs are sent through the game's `Network.Invoke("Entity_Invoke", entityId, method, ...)` transport, which uses a RemoteFunction (`InvokeServer`), not a GUI signal. The script never teleports, walks, changes character physics, or fires proximity prompts. Server validation still applies: if a task requires proximity, its rejection is displayed and backed off; this update does not claim to bypass a server distance check. The egg script is unchanged.
 
 ## Add another game
 
@@ -43,5 +47,7 @@ Game scripts should default to stopped, guard their supported place IDs, stop th
 ## Validation status
 
 All three Luau files compiled successfully. The universal loader passed 17 isolated routing/error-handling checks without executing gameplay. Isolated game-logic tests also passed (15 egg checks and 31 restaurant planner checks). The restaurant planner selected a valid task from the live state in read-only mode. End-to-end live gameplay has not been verified.
+
+The 1.1.0 restaurant update additionally passed 10 mocked remote-transport checks covering all eight job methods and rejection/error propagation. Static checks confirm that the restaurant script contains no character-movement or simulated-signal calls. These checks do not establish whether a server accepts a distant task.
 
 The game scripts fetch a fixed MattLib revision. MattLib is a separate MIT-licensed dependency; its source and assets are not bundled here. Updating files on `main` changes what the shared loadstring loads.
