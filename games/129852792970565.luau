@@ -1,4 +1,4 @@
--- Egg collector / selectable return modes for Place 129852792970565 (1.2.1).
+-- Egg collector / streaming / guard-aware return / recovery (1.3.0).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
@@ -16,6 +16,7 @@ end
 local hubContext = ...
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
 local TweenService = game:GetService("TweenService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -51,8 +52,16 @@ local state = {
     snapAfter = 1, snapDistance = 12,
     speedMode = "Match carry speed", customSpeed = 100,
     banks = 0, slips = 0, fault = nil,
+    autoRecover = true, retryDelay = 5, fallbackOnReset = true, resumeAt = 0,
+    failures = 0, actionSerial = 0, recoveredAction = -1,
+    streamOn = true, streamScope = "All zones", streamTimeout = 2,
+    streamBusy = false, streamCursor = 1, streamVisited = {}, streamReady = false,
+    nextStreamAt = 0, scanRequested = false, eggCache = {}, cacheTTL = 90,
+    guardRoute = true, skipFastGuards = false,
 }
 local app, statusLabel, countLabel, activePrompt, activeTween, autoToggle, speedSlider, returnDelaySlider, returnDistanceSlider
+local returnModeControl, speedModeControl, streamLabel, streamToggle
+local cacheLoadedEggs, resolveEgg, zoneAllowed, buildGuardRoute, streamStep
 local connections = {}
 local lifetime = Instance.new("BindableFunction")
 lifetime.Name = LIFETIME_NAME
@@ -138,12 +147,54 @@ function ReturnPolicy.allowSnap(mode, expectedId, currentId, bankConfirmed)
 end
 -- RETURN_POLICY_END
 
-local function pauseAuto(message)
+-- SUPPORT_POLICY_BEGIN
+local SupportPolicy = {}
+function SupportPolicy.retryDelay(base, failures)
+    return math.min(60, math.max(2, base) * 2 ^ math.min(math.max(failures - 1, 0), 4))
+end
+function SupportPolicy.recoverable(kind)
+    return kind == "reset" or kind == "guard" or kind == "respawn" or kind == "unconfirmed" or kind == "blocked" or kind == "timeout"
+end
+function SupportPolicy.offsets(zones, gap)
+    local out, cursor = {}, 0
+    for _, zone in ipairs(zones) do
+        out[#out+1] = {index=zone.Index, zone=zone, start=cursor,
+            center=cursor+zone.LengthStuds*0.5, nest=cursor+(zone.NestOffsetStuds or zone.LengthStuds*0.5)}
+        cursor = cursor + zone.LengthStuds + gap
+    end
+    return out
+end
+-- SUPPORT_POLICY_END
+
+local function failureStatus()
+    if state.auto and state.resumeAt > os.clock() then
+        status(string.format("Auto ON; retry in %.0fs. %s", state.resumeAt-os.clock(), state.fault or "Recovering."))
+    elseif state.fault then status(state.fault) end
+end
+
+local function pauseAuto(message, kind)
     state.fault = message
-    state.auto = false
-    if autoToggle then autoToggle:SetValue(false) end
+    state.epoch = state.epoch + 1
     cancelTween()
-    status(message)
+    endHold()
+    if state.auto and state.autoRecover and SupportPolicy.recoverable(kind) then
+        if state.recoveredAction ~= state.actionSerial then
+            state.recoveredAction = state.actionSerial
+            state.failures = state.failures + 1
+            state.resumeAt = os.clock() + SupportPolicy.retryDelay(state.retryDelay, state.failures)
+        end
+        if (kind == "reset" or kind == "unconfirmed") and state.fallbackOnReset then
+            state.returnMode, state.speedMode = "tween", "Match carry speed"
+            if returnModeControl then returnModeControl:SetValue("tween") end
+            if speedModeControl then speedModeControl:SetValue("Match carry speed") end
+            state.fault = message .. " Using tween-only/carry-speed cap for the retry."
+        end
+        failureStatus()
+    else
+        state.auto = false
+        if autoToggle then autoToggle:SetValue(false) end
+        status(message .. " Auto OFF.")
+    end
 end
 
 local function pickupPrompt(egg)
@@ -173,6 +224,7 @@ local function available(egg)
 end
 
 local function findEgg()
+    if cacheLoadedEggs then cacheLoadedEggs() end
     local _, root = characterParts()
     local runtime = workspace:FindFirstChild("Runtime")
     local best, bestPrompt, bestDistance, bestRank, count = nil, nil, math.huge, -1, 0
@@ -181,7 +233,7 @@ local function findEgg()
         local folder = runtime:FindFirstChild(name)
         if folder then
             for _, egg in ipairs(folder:GetChildren()) do
-                if available(egg) then
+                if available(egg) and (not zoneAllowed or zoneAllowed(egg:GetAttribute("ZoneIndex"))) then
                     local prompt = pickupPrompt(egg)
                     local position = prompt and promptPosition(prompt, egg)
                     if position then
@@ -206,7 +258,9 @@ end
 local function refreshCount()
     local _, _, count = findEgg()
     if state.alive and countLabel then
-        countLabel:Update({ Text = "Available matching eggs: " .. tostring(count) })
+        local cached = 0
+        for _ in pairs(state.eggCache) do cached = cached+1 end
+        countLabel:Update({ Text = "Loaded eligible eggs: " .. tostring(count) .. " | Cached region hints: " .. cached })
     end
 end
 
@@ -223,6 +277,172 @@ end
 local function bankDestination()
     -- Fixed endpoint requested by the user; shared by automatic/manual returns.
     return Vector3.new(-208.12997436523438, 4.237678050994873, 399.94561767578125)
+end
+
+-- Streaming requests are hints, not a way to disable Roblox's streaming budget.
+local zoneConfig
+pcall(function() zoneConfig = require(ReplicatedStorage.Shared.Config.ZoneConfig) end)
+local zoneDefinitions = zoneConfig and zoneConfig.Zones or {
+    {Index=1,LengthStuds=55,NestOffsetStuds=40,RequiredSpeed=10,GuardSpeed=14},
+    {Index=2,LengthStuds=130,NestOffsetStuds=90,RequiredSpeed=900,GuardSpeed=28.5},
+    {Index=3,LengthStuds=300,NestOffsetStuds=210,RequiredSpeed=10000,GuardSpeed=54},
+    {Index=4,LengthStuds=520,NestOffsetStuds=365,RequiredSpeed=170000,GuardSpeed=78},
+    {Index=5,LengthStuds=730,NestOffsetStuds=510,RequiredSpeed=2500000,GuardSpeed=110.5},
+    {Index=6,LengthStuds=870,NestOffsetStuds=610,RequiredSpeed=18000000,GuardSpeed=136},
+    {Index=7,LengthStuds=676,NestOffsetStuds=470,RequiredSpeed=150000000,GuardSpeed=160},
+    {Index=8,LengthStuds=900,NestOffsetStuds=630,RequiredSpeed=1000000000,GuardSpeed=163},
+}
+local zoneByIndex = {}
+for _, zone in ipairs(zoneDefinitions) do zoneByIndex[zone.Index] = zone end
+
+local function streamPoints()
+    local offsets = SupportPolicy.offsets(zoneDefinitions, 6)
+    local axis, origin = Vector3.new(1,0,0), Vector3.new(-190,bankDestination().Y,400)
+    -- Prefer a currently replicated zone strip as the map anchor. The fallback
+    -- origin/gap comes from the inspected place, not a teleport destination.
+    for _, strip in ipairs(CollectionService:GetTagged("ZoneStrip")) do
+        local index = strip:GetAttribute("ZoneIndex")
+        if strip:IsA("BasePart") and offsets[index] then
+            axis = strip.CFrame.RightVector
+            if (strip.Position-bankDestination()):Dot(axis) < 0 then axis = -axis end
+            origin = strip.Position-axis*offsets[index].center
+            break
+        end
+    end
+    local points = {}
+    local speed = tonumber(player:GetAttribute("Speed")) or 0
+    for _, item in ipairs(offsets) do
+        if state.streamScope == "All zones" or speed >= (item.zone.RequiredSpeed or 0) or item.index == 1 then
+            local p = origin+axis*item.nest
+            points[#points+1] = {index=item.index,position=Vector3.new(p.X,bankDestination().Y,p.Z)}
+        end
+    end
+    return points
+end
+
+zoneAllowed = function(index)
+    if not state.skipFastGuards then return true end
+    local zone = zoneByIndex[index]
+    local _, _, humanoid = characterParts()
+    if not zone or not humanoid then return true end
+    local speed = humanoid.WalkSpeed * (carrying() and 1 or 0.9)
+    local configured = ReturnPolicy.speed(state.customSpeed,speed,state.speedMode == "Match carry speed") or 0
+    return configured >= (zone.GuardSpeed or 0)
+end
+
+cacheLoadedEggs = function()
+    local runtime = workspace:FindFirstChild("Runtime")
+    if not runtime then return end
+    local now = os.clock()
+    for id, entry in pairs(state.eggCache) do
+        if now-entry.seen > state.cacheTTL then state.eggCache[id] = nil end
+    end
+    for _, name in ipairs({"WorldEggs","DroppedEggs"}) do
+        local folder = runtime:FindFirstChild(name)
+        if folder then for _, egg in ipairs(folder:GetChildren()) do
+            local id = egg:GetAttribute("EggId") or egg.Name
+            local holder = egg:GetAttribute("CarriedBy")
+            if holder ~= nil and holder ~= 0 then state.eggCache[id] = nil
+            else
+                local prompt = pickupPrompt(egg)
+                local p = prompt and promptPosition(prompt,egg)
+                if p then state.eggCache[id] = {id=id,position=p,rarity=egg:GetAttribute("Rarity"),
+                    zone=egg:GetAttribute("ZoneIndex"),seen=now} end
+            end
+        end end
+    end
+end
+
+local function requestRegion(position, current)
+    local untilTime = os.clock()+state.streamTimeout+1
+    while state.streamBusy and current() and os.clock()<untilTime do task.wait(0.05) end
+    if state.streamBusy or not current() then return false end
+    local enabled = true
+    pcall(function() enabled = workspace.StreamingEnabled end)
+    if enabled == false then cacheLoadedEggs(); return true end
+    state.streamBusy = true
+    local ok, reason = pcall(function() player:RequestStreamAroundAsync(position,state.streamTimeout) end)
+    state.streamBusy = false
+    if state.alive then cacheLoadedEggs() end
+    if state.alive then state.streamError = not ok and tostring(reason) or nil end
+    return ok and current()
+end
+
+streamStep = function()
+    if not state.alive or state.busy or carrying() or state.streamBusy then return end
+    local points = streamPoints()
+    if #points == 0 then state.streamReady = true; return end
+    if state.streamCursor > #points then state.streamCursor = 1 end
+    local slot = state.streamCursor
+    local point = points[slot]
+    if streamLabel then streamLabel:Update({Text="Requesting zone "..point.index.." ("..slot.."/"..#points.."). Distant regions may stream out again."}) end
+    requestRegion(point.position,function() return state.alive and not state.busy and not carrying() end)
+    if not state.alive then return end
+    state.streamVisited[slot] = true
+    state.streamCursor = slot+1
+    if slot == #points then
+        state.streamReady, state.scanRequested = true, false
+        if streamLabel then streamLabel:Update({Text=state.streamError and ("Streaming request failed: "..state.streamError)
+            or "Zone scan complete. Cached hints are revalidated before pickup."}) end
+    end
+    state.nextStreamAt = os.clock()+2
+end
+
+resolveEgg = function(current)
+    if not state.streamOn then return findEgg() end
+    cacheLoadedEggs()
+    local _, root = characterParts()
+    local best, bestRank, bestDistance = nil, -1, math.huge
+    for _, entry in pairs(state.eggCache) do
+        if table.find(state.rarities,entry.rarity) and zoneAllowed(entry.zone) and os.clock()-entry.seen <= state.cacheTTL then
+            local rank = RARITY_RANK[entry.rarity] or 0
+            local distance = root and (root.Position-entry.position).Magnitude or math.huge
+            local better = state.priority == "Highest rarity first" and (rank>bestRank or rank==bestRank and distance<bestDistance)
+                or state.priority ~= "Highest rarity first" and distance<bestDistance
+            if better then best,bestRank,bestDistance = entry,rank,distance end
+        end
+    end
+    if not best then return findEgg() end
+    requestRegion(best.position,current)
+    if not current() then return nil end
+    -- A cached coordinate is only a streaming hint, never a blind teleport.
+    local deadline = os.clock()+1
+    repeat
+        local runtime = workspace:FindFirstChild("Runtime")
+        if runtime then for _, name in ipairs({"WorldEggs","DroppedEggs"}) do
+            local folder = runtime:FindFirstChild(name)
+            if folder then for _, egg in ipairs(folder:GetChildren()) do
+                if (egg:GetAttribute("EggId") or egg.Name) == best.id and available(egg) and zoneAllowed(egg:GetAttribute("ZoneIndex")) then
+                    local prompt = pickupPrompt(egg)
+                    if prompt and promptPosition(prompt,egg) then return egg,prompt end
+                end
+            end end
+        end end
+        if not current() then return nil end
+        task.wait(0.1)
+    until os.clock()>=deadline
+    state.eggCache[best.id] = nil
+    return findEgg()
+end
+
+buildGuardRoute = function(root, goal)
+    if not state.guardRoute or root.Position.X <= goal.X+40 then return {goal} end
+    local center, width = 400, zoneConfig and zoneConfig.Corridor and zoneConfig.Corridor.WidthStuds or 160
+    local low, high = center-width*0.5+12, center+width*0.5-12
+    local lane = root.Position.Z < center and low or high
+    local runtime = workspace:FindFirstChild("Runtime")
+    local guards = runtime and runtime:FindFirstChild("Guards")
+    local nearest, nearestPosition = math.huge, nil
+    if guards then for _, guard in ipairs(guards:GetChildren()) do
+        local part = guard:FindFirstChild("HumanoidRootPart") or guard.PrimaryPart
+        if part and part:IsA("BasePart") then
+            local distance = (part.Position-root.Position).Magnitude
+            if distance < nearest then nearest,nearestPosition = distance,part.Position end
+        end
+    end end
+    if nearestPosition then lane = nearestPosition.Z < center and high or low end
+    local firstX = math.max(goal.X+28,root.Position.X-24)
+    return {Vector3.new(firstX,goal.Y,lane),Vector3.new(goal.X+28,goal.Y,lane),goal}
 end
 
 local function teleportReturn(id, root, current, mode, bankConfirmed)
@@ -242,6 +462,8 @@ local function tweenToBank(id, root, humanoid, current)
     local mode = state.returnMode or "tween"
     if mode == "manual" then return false, "Manual return selected; choose another mode to use this button." end
     local goal = bankDestination()
+    local route = state.guardRoute and buildGuardRoute(root,goal) or {goal}
+    local routeIndex = 1
     local bankBaseline, slipBaseline = state.banks, state.slips
     local rejectBaseline = tonumber(player:GetAttribute("RejectCount")) or 0
     local started = os.clock()
@@ -255,7 +477,7 @@ local function tweenToBank(id, root, humanoid, current)
         if result == "banked" then bankConfirmed = true end
         if result == "rejected" then
             cancelTween()
-            return false, "Server rejected the return. Auto paused; change return mode/speed or return manually."
+            return false, "Server rejected the return; change return mode/speed or return manually.", "reset"
         end
         local remaining = (goal - root.Position).Magnitude
         if bankConfirmed and remaining < 0.15 then
@@ -264,14 +486,14 @@ local function tweenToBank(id, root, humanoid, current)
         if snapped then
             -- Never repeatedly snap or tween after an unconfirmed teleport.
             if os.clock() - snappedAt > 3 then
-                return false, "Teleport return was not confirmed at the destination. Auto paused."
+                return false, "Teleport return was not confirmed at the destination.", "unconfirmed"
             end
             task.wait(0.05)
         elseif not bankConfirmed and (result == "unconfirmed" or state.banks > bankBaseline) then
             cancelTween()
             clearedAt = clearedAt or os.clock()
             if os.clock() - clearedAt > 3 then
-                return false, "Carry state changed without a complete bank confirmation. Auto paused."
+                return false, "Carry state changed without a complete bank confirmation.", "unconfirmed"
             end
             task.wait(0.05)
         elseif ReturnPolicy.shouldSnap(mode, os.clock() - started, remaining, bankConfirmed, snapAfter, snapDistance) then
@@ -288,17 +510,20 @@ local function tweenToBank(id, root, humanoid, current)
                 if state.banks > bankBaseline and not carrying() then
                     return true, "Bank confirmed; fixed return destination reached."
                 end
-                if state.slips > slipBaseline then return false, "Egg slipped back; auto paused." end
+                if state.slips > slipBaseline then return false, "Egg slipped back.", "reset" end
                 task.wait(0.05)
             until os.clock() >= untilTime
-            return false, "Reached the destination, but the server did not confirm a bank. Auto paused."
+            return false, "Reached the destination, but the server did not confirm a bank.", "unconfirmed"
         else
             clearedAt = nil
             local speed = ReturnPolicy.speed(state.customSpeed, humanoid.WalkSpeed, state.speedMode == "Match carry speed")
-            if not speed then return false, "Carry speed is zero; tween stopped." end
+            if not speed then return false, "Carry speed is zero; tween stopped.", "blocked" end
             local origin = root.Position
-            local nextPoint = origin:Lerp(goal, math.min(1, 24 / remaining))
-            local direction = Vector3.new(goal.X - nextPoint.X, 0, goal.Z - nextPoint.Z)
+            while routeIndex < #route and (route[routeIndex]-origin).Magnitude < 2 do routeIndex = routeIndex+1 end
+            local waypoint = route[routeIndex]
+            local legDistance = (waypoint-origin).Magnitude
+            local nextPoint = origin:Lerp(waypoint, math.min(1, 24 / math.max(legDistance,0.01)))
+            local direction = Vector3.new(waypoint.X - nextPoint.X, 0, waypoint.Z - nextPoint.Z)
             if direction.Magnitude < 0.01 then direction = Vector3.new(-1, 0, 0) end
             local duration = (nextPoint - origin).Magnitude / speed
             local tween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear),
@@ -325,12 +550,12 @@ local function tweenToBank(id, root, humanoid, current)
                 and state.slips == slipBaseline
                 and (tonumber(player:GetAttribute("RejectCount")) or 0) <= rejectBaseline
                 and (root.Position - nextPoint).Magnitude > 6 then
-                return false, "Tween was blocked or corrected. Auto paused; no automatic snap retry was attempted."
+                return false, "Tween was blocked or corrected; no automatic snap retry was attempted.", "blocked"
             end
         end
     end
     cancelTween()
-    return false, current() and "Return timed out; auto paused." or "Return cancelled."
+    return false, current() and "Return timed out." or "Return cancelled.", current() and "timeout" or "cancelled"
 end
 
 local function runAction(collect)
@@ -344,10 +569,8 @@ local function runAction(collect)
     if collect and state.returnMode ~= "manual" and not state.bankSensor then
         status("Bank feedback remote is not ready. Retry after the game loads."); return
     end
-    local egg, prompt = findEgg()
-    if not egg then status("No available eggs match the selected rarities."); return end
-
     state.busy = true
+    state.actionSerial = state.actionSerial + 1
     state.fault = nil
     state.saved = root.CFrame
     local epoch = state.epoch
@@ -358,6 +581,9 @@ local function runAction(collect)
     end
     task.spawn(function()
         local ok, reason = xpcall(function()
+            local egg, prompt
+            if resolveEgg then egg,prompt = resolveEgg(current) else egg,prompt = findEgg() end
+            if not egg then status("No eligible egg is loaded yet; scanning/guard filters may be active."); return end
             if not current() or not available(egg) or not prompt.Parent then return end
             local position = promptPosition(prompt, egg)
             if not position then return end
@@ -403,8 +629,11 @@ local function runAction(collect)
             state.carryLock = true
             status("Picked up " .. rarity .. " egg. Return mode: " .. state.returnMode .. ".")
             if state.returnMode ~= "manual" and current() then
-                local banked, result = tweenToBank(id, root, humanoid, current)
-                if banked then status(result) elseif current() then pauseAuto(state.fault or result) end
+                local banked, result, kind = tweenToBank(id, root, humanoid, current)
+                if banked then
+                    state.failures,state.resumeAt,state.fault = 0,0,nil
+                    status(result)
+                elseif current() then pauseAuto(state.fault or result,kind) end
             end
         end, debug.traceback)
         endHold()
@@ -413,9 +642,9 @@ local function runAction(collect)
         state.busy = false
         if not ok then
             warn("[Egg Teleport] " .. tostring(reason))
-            pauseAuto("Action failed. Auto paused; see executor console.")
+            pauseAuto("Action failed; see executor console.","runtime")
         elseif state.fault then
-            status(state.fault)
+            failureStatus()
         end
     end)
 end
@@ -428,6 +657,7 @@ local function tweenHeldEgg()
     if not carrying() or not root then status("No held egg / living character."); return end
     if not state.bankSensor then status("Bank feedback remote is not ready."); return end
     state.busy, state.carryLock, state.fault = true, true, nil
+    state.actionSerial = state.actionSerial + 1
     local epoch = state.epoch
     local function current()
         return state.alive and state.epoch == epoch and player.Character == character
@@ -435,19 +665,22 @@ local function tweenHeldEgg()
             and player:GetAttribute("Ragdolled") ~= true
     end
     task.spawn(function()
-        local ok, banked, message = pcall(tweenToBank, id, root, humanoid, current)
+        local ok, banked, message, kind = pcall(tweenToBank, id, root, humanoid, current)
         cancelTween()
         state.busy, state.carryLock = false, carrying()
-        if not ok then pauseAuto("Tween error: " .. tostring(banked))
+        if not ok then pauseAuto("Tween error: " .. tostring(banked),"runtime")
         elseif current() then
-            if banked then status(message) else pauseAuto(state.fault or message) end
-        elseif state.fault then status(state.fault) end
+            if banked then
+                state.failures,state.resumeAt,state.fault = 0,0,nil
+                status(message)
+            else pauseAuto(state.fault or message,kind) end
+        elseif state.fault then failureStatus() end
     end)
 end
 
 local window = app:CreateWindow({
-    Id = "eggs", Title = "Egg Collector · Return Modes", Design = "MintGlass",
-    Size = { 640, 620 }, OpenKey = "RightShift", Wallpaper = false,
+    Id = "eggs", Title = "Egg Collector · Streaming & Recovery", Design = "MintGlass",
+    Size = { 720, 650 }, OpenKey = "RightShift", Wallpaper = false,
     OnClose = cleanup,
 })
 local tab = window:AddTab({ Title = "Eggs" })
@@ -471,7 +704,7 @@ countLabel = section:AddText({ Text = "Available matching eggs: 0" })
 statusLabel = section:AddParagraph({ Text = "Status: Ready." })
 section:AddButton({ Title = "Teleport to best selected egg (empty hands)", Callback = function() runAction(false) end })
 section:AddButton({ Title = "Get egg + selected return", Variant = "primary", Callback = function() runAction(true) end })
-section:AddDropdown({
+returnModeControl = section:AddDropdown({
     Id = "returnMode", Title = "Return mode", Default = "tween",
     Options = {
         {value = "tween", label = "Tween only (default)"},
@@ -493,7 +726,10 @@ autoToggle = section:AddToggle({
     Callback = function(value)
         state.auto = value
         state.epoch = state.epoch + 1
-        if value then state.fault = nil else cancelTween(); endHold() end
+        if value then
+            state.fault,state.resumeAt,state.failures,state.recoveredAction = nil,0,0,-1
+            if state.streamOn then state.streamReady,state.streamCursor,state.streamVisited = false,1,{} end
+        else state.resumeAt = 0; cancelTween(); endHold() end
         status(value and ("Auto enabled; priority: " .. state.priority .. ".") or "Auto stopped; active return cancelled.")
     end,
 })
@@ -515,10 +751,10 @@ returnSettings:AddButton({Title = "Stop current action", Callback = function()
     cancelTween(); endHold()
     status("Action stopped. No further tween/teleport requests will run for this action.")
 end})
-returnSettings:AddParagraph({Text = "Fixed target: X=-208.12997436523438, Y=4.237678050994873, Z=399.94561767578125. A teleport is not counted as a bank unless the server confirms it. Rejected teleports are never spammed or automatically retried."})
+returnSettings:AddParagraph({Text = "Fixed target: X=-208.12997436523438, Y=4.237678050994873, Z=399.94561767578125. A teleport is not counted as a bank unless the server confirms it. No repeated teleport is attempted within a return; recovery waits before a separate pickup attempt."})
 
 local settings = window:AddTab({Title = "Speed & selection"}):AddSection({Title = "Tween speed"})
-settings:AddDropdown({Id = "speedMode", Title = "Tween speed mode", Default = "Match carry speed",
+speedModeControl = settings:AddDropdown({Id = "speedMode", Title = "Tween speed mode", Default = "Match carry speed",
     Options = {"Match carry speed", "Custom speed (may reset)"}, Callback = function(value)
         state.speedMode = value
         if speedSlider then speedSlider:Update({Disabled = value == "Match carry speed"}) end
@@ -526,7 +762,7 @@ settings:AddDropdown({Id = "speedMode", Title = "Tween speed mode", Default = "M
 speedSlider = settings:AddSlider({Id = "customSpeed", Title = "Custom tween speed (studs/sec)",
     Min = 10, Max = 250, Step = 5, Default = 100, Disabled = true,
     Callback = function(value) state.customSpeed = value end})
-settings:AddParagraph({Text = "Match carry speed uses 90% of the current Humanoid.WalkSpeed. Custom mode can be faster, but the server may still reset the egg. No carry speed, collision, anchoring or network settings are changed. Auto pauses on a reset or an unconfirmed bank."})
+settings:AddParagraph({Text = "Match carry speed uses 90% of the current Humanoid.WalkSpeed. Custom mode can be faster, but the server may still reset the egg. No carry speed, collision, anchoring or network settings are changed. Recovery keeps Auto ON with a cooldown after a reset or unconfirmed bank."})
 settings:AddButton({ Title = "Return previous position (empty hands only)", Callback = function()
     if state.busy then return end
     local _, root = characterParts()
@@ -538,6 +774,43 @@ end })
 settings:AddButton({Title = "Select all rarities", Callback = function() raritySelect:SetValue(table.clone(RARITIES)) end})
 settings:AddButton({Title = "Clear rarity selection", Callback = function() raritySelect:SetValue({}) end})
 
+local streaming = window:AddTab({Title = "Streaming"}):AddSection({Title = "Progressive region loading"})
+streamLabel = streaming:AddParagraph({Text = "Region requests do not guarantee the whole map stays rendered."})
+streamToggle = streaming:AddToggle({Id = "streamOn", Title = "Request zones before auto collection", Default = true, Callback = function(value)
+    state.streamOn = value
+    state.streamReady,state.streamCursor,state.streamVisited = not value,1,{}
+    if not value then state.scanRequested = false end
+end})
+streaming:AddDropdown({Id = "streamScope", Title = "Zones to scan", Default = "All zones", Options = {"All zones","Unlocked zones"},
+    Callback = function(value) state.streamScope = value; state.streamReady,state.streamCursor,state.streamVisited = false,1,{} end})
+streaming:AddSlider({Id = "streamTimeout", Title = "Region request timeout (seconds)", Min = 1, Max = 5, Step = 1, Default = 2,
+    Callback = function(value) state.streamTimeout = value end})
+streaming:AddButton({Title = "Scan zones now (no teleport)", Callback = function()
+    if carrying() then status("Finish the held egg first; region scanning waits while carrying."); return end
+    streamToggle:SetValue(true)
+    state.streamOn,state.scanRequested,state.streamReady,state.streamCursor,state.streamVisited = true,true,false,1,{}
+    status("Zone scan queued. No character movement is used to request regions.")
+end})
+streaming:AddParagraph({Text = "Uses Player:RequestStreamAroundAsync, scans one region at a time and caches egg hints. A cached egg is streamed/revalidated before teleporting to its real prompt. Roblox can stream distant regions out again; this cannot force a permanent all-map render."})
+
+local recovery = window:AddTab({Title = "Recovery"}):AddSection({Title = "Reset handling & guard avoidance"})
+recovery:AddToggle({Id = "autoRecover", Title = "Keep auto ON: cooldown and retry after resets", Default = true,
+    Callback = function(value) state.autoRecover = value end})
+recovery:AddSlider({Id = "retryDelay", Title = "Base retry cooldown (seconds)", Min = 2, Max = 30, Step = 1, Default = 5,
+    Callback = function(value) state.retryDelay = value end})
+recovery:AddToggle({Id = "fallbackOnReset", Title = "After reset: use tween-only + carry-speed cap", Default = true,
+    Callback = function(value) state.fallbackOnReset = value end})
+recovery:AddToggle({Id = "guardRoute", Title = "Guard avoidance: wide corridor route", Default = true,
+    Callback = function(value) state.guardRoute = value end})
+recovery:AddToggle({Id = "skipFastGuards", Title = "Skip zones whose base guard speed exceeds return speed", Default = false,
+    Callback = function(value) state.skipFastGuards = value end})
+recovery:AddButton({Title = "Resume auto now", Callback = function()
+    state.resumeAt,state.failures,state.fault = 0,0,nil
+    autoToggle:SetValue(true)
+    status("Auto ON; waiting for a living, empty-handed character and any initial zone scan.")
+end})
+recovery:AddParagraph({Text = "Slips/catches/rejections now keep Auto enabled with increasing cooldowns (up to 60s). Runtime errors or disabling recovery still switch it off. A held egg must clear or be returned before another pickup. Wide-lane routing and speed filtering are avoidance only: they do not cancel server boss hits or grant invulnerability."})
+
 local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
 local effects = remotes and remotes:WaitForChild("PlayEffect", 10)
 if effects and effects:IsA("RemoteEvent") then
@@ -547,7 +820,7 @@ if effects and effects:IsA("RemoteEvent") then
         if payload.key == "EggBanked" then state.banks = state.banks + 1
         elseif payload.key == "GuardCatch" and state.busy then
             state.slips = state.slips + 1
-            pauseAuto("Guard caught you. Auto paused and active return cancelled.")
+            pauseAuto("Guard caught you; active return cancelled.","guard")
         end
     end)
 end
@@ -557,14 +830,14 @@ if notifications and notifications:IsA("RemoteEvent") then
         local text = type(payload) == "table" and payload.text
         if type(text) == "string" and text:lower():find("slipped back", 1, true) then
             state.slips = state.slips + 1
-            if state.busy or state.auto then pauseAuto("Egg slipped back. Auto paused; lower the custom tween speed or return manually.") end
+            if state.busy or state.auto then pauseAuto("Egg slipped back; lower return speed or change return mode.","reset") end
         end
     end)
 end
 local lastReject = tonumber(player:GetAttribute("RejectCount")) or 0
 connections[#connections+1] = player:GetAttributeChangedSignal("RejectCount"):Connect(function()
     local value = tonumber(player:GetAttribute("RejectCount")) or 0
-    if value > lastReject and state.busy then pauseAuto("Server rejection counter increased. Auto paused; return was not confirmed.") end
+    if value > lastReject and state.busy then pauseAuto("Server rejection counter increased; return was not confirmed.","reset") end
     lastReject = value
 end)
 connections[#connections+1] = player:GetAttributeChangedSignal("CarryingEgg"):Connect(function()
@@ -573,7 +846,7 @@ end)
 connections[#connections+1] = player.CharacterAdded:Connect(function()
     state.epoch = state.epoch + 1
     cancelTween(); endHold()
-    pauseAuto("Respawned. Auto paused; restart after your character loads.")
+    pauseAuto("Respawned; waiting for character recovery.","respawn")
 end)
 
 refreshCount()
@@ -583,10 +856,32 @@ task.spawn(function()
             state.carryLock = carrying()
             refreshCount()
             if state.auto then
-                if carrying() then status("Carrying an egg; waiting for you to bank it.")
+                if state.resumeAt > os.clock() then failureStatus()
+                elseif player:GetAttribute("Ragdolled") == true then status("Auto ON; waiting for ragdoll recovery.")
+                elseif carrying() then status("Auto ON; waiting for held egg to clear. Use Return current egg if needed.")
+                elseif state.streamOn and not state.streamReady then status("Auto ON; initial zone streaming scan in progress.")
                 else runAction(true) end
             end
         end
         task.wait(2)
+    end
+end)
+
+task.spawn(function()
+    while state.alive do
+        local enabled = true
+        pcall(function() enabled = workspace.StreamingEnabled end)
+        if enabled == false then
+            state.streamReady,state.scanRequested = true,false
+        elseif state.streamOn and (state.auto or state.scanRequested) and state.resumeAt <= os.clock()
+            and not state.busy and not carrying() and not state.streamBusy and os.clock() >= state.nextStreamAt then
+            local ok, reason = pcall(streamStep)
+            if not ok then
+                state.streamError,state.streamReady = tostring(reason),true
+                state.nextStreamAt = os.clock()+5
+                if streamLabel then streamLabel:Update({Text="Region scan unavailable: "..tostring(reason)}) end
+            end
+        end
+        task.wait(0.25)
     end
 end)

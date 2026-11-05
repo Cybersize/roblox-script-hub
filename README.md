@@ -30,12 +30,12 @@ The executor must be injected in the current Roblox client. If all HTTP transpor
 
 | Place ID | Script | Features |
 | --- | --- | --- |
-| `129852792970565` | [Egg Collector · Return Modes](games/129852792970565.luau) | Multi-select rarities, highest-rarity priority, six return modes and adjustable tween speed/timing/distance |
+| `129852792970565` | [Egg Collector · Streaming & Recovery](games/129852792970565.luau) | Multi-select rarity priority, six return modes, progressive region requests, reset recovery and guard-aware routing |
 | `104432981439032` | [Restaurant Remote Auto Play](games/104432981439032.luau) | Remote-only seat assignment, orders, cooking/collecting, serving, table clearing and dishwashing; no character movement |
 
 **RightShift** hides/shows either menu. The restaurant script starts stopped; press **Start all** to enable its duties. Cooking uses the game's normal timers. Ingredient farming, purchases, spawning customers and staff configuration are not included.
 
-### Egg collector (1.2.1)
+### Egg collector (1.3.0)
 
 - Select multiple rarities. **Highest rarity first** is the default; eggs of equal rarity are ordered by distance. Empty selection targets nothing. **Nearest selected** is also available.
 - An egg pickup is acknowledged through the player's `CarryingEgg` attribute before returning. Ordinary travel and previous-position buttons remain empty-handed only. Experimental return modes explicitly allow one carried-egg teleport and may reset the egg.
@@ -49,13 +49,16 @@ The executor must be injected in the current Roblox client. If all HTTP transpor
 - **Return options** provides the timed delay (0.25–10 seconds, default 1) and near-target distance (1–200 studs, default 12), plus Return current egg and Stop controls. Mode/timing/distance changes apply to the next return. To switch an active return, Stop it, choose a mode, then press Return current egg.
 - Every automatic return mode and the Return current egg button share the fixed endpoint `Vector3.new(-208.12997436523438, 4.237678050994873, 399.94561767578125)`. A successful return requires the local player's `EggBanked` event, cleared carry state and arrival at the endpoint. A teleport or cleared carry state alone is not reported as success. Cancellation, corrections and rejections can still stop a return. Teleports are never spammed/retried inside an action.
 - **Speed & selection → Match carry speed** defaults to 90% of the current Humanoid.WalkSpeed. Choose **Custom speed (may reset)** to use the 10–250 studs/second slider for a faster tween. The script does not change WalkSpeed, collision, anchoring or network settings. Server checks may reject fast tweens or carried-egg teleports; none of these modes is a guaranteed reset bypass.
-- Slips, guard catches, rejection-counter increases, blocked movement and unconfirmed banks pause auto-collect. **Stop current action** and **Unload** cancel an active tween.
+- **Recovery → Keep auto ON** is enabled by default. An egg slipping back, a guard catch, a rejection-counter increase, a blocked return, an unconfirmed bank or a respawn cancels the current action but keeps the master toggle ON. Retries start with a 5-second cooldown, doubling after separate failed actions up to 60 seconds. Successful banking clears the backoff. **Resume auto now** clears the cooldown; **Stop current action** and **Unload** cancel the action and stop auto.
+- **After reset: use tween-only + carry-speed cap** is enabled by default. A reset or unconfirmed bank changes the next attempt to **Tween only** and **Match carry speed**, with the dropdowns updated to match. Turn this option off to retain an experimental mode. A held egg must clear or be returned before another pickup; recovery never blindly teleports it again. Runtime errors still stop auto, and disabling **Keep auto ON** restores stop-on-failure behavior.
+- **Streaming** requests regions through Roblox's native `Player:RequestStreamAroundAsync` without moving the character. Auto waits for an initial zone sweep, then periodically requests one region at a time while idle and empty-handed. Choose **All zones** (default) or **Unlocked zones**, set a 1–5 second request timeout, or press **Scan zones now (no teleport)**. Loaded egg positions are cached briefly as region hints and revalidated against a real replicated egg and prompt before travel. Priority is among loaded or recently cached eggs, not an omniscient server list. Requests do not disable streaming or guarantee the entire map remains rendered; distant regions can unload again. If native requests fail, already-loaded eggs remain usable.
+- **Guard avoidance: wide corridor route** is enabled by default: returns favor a corridor edge away from the nearest loaded guard, then finish at the same fixed bank endpoint. It is avoidance, not anti-hit/godmode: server-side boss hits still apply. **Skip zones whose base guard speed exceeds return speed** is an optional filter (off by default); it compares configured base speeds, not every possible guard acceleration or attack.
 
 Default rarity order: Divine → Super Secret → Secret → Ascendant → Exotic → Relic → Mythic → Legendary → Epic → Rare → Common. Exclusive is paid-only and is not included among world-spawn eggs.
 
 ### Restaurant remote-only mode (1.1.1)
 
-Restaurant jobs are sent through the game's `Network.Invoke("Entity_Invoke", entityId, method, ...)` transport, which uses a RemoteFunction (`InvokeServer`), not a GUI signal. The script never teleports, walks, changes character physics, or fires proximity prompts. Server validation still applies: if a task requires proximity, its rejection is displayed and backed off; this update does not claim to bypass a server distance check. The egg script is unchanged.
+Restaurant jobs are sent through the game's `Network.Invoke("Entity_Invoke", entityId, method, ...)` transport, which uses a RemoteFunction (`InvokeServer`), not a GUI signal. The script never teleports, walks, changes character physics, or fires proximity prompts. Server validation still applies: if a task requires proximity, its rejection is displayed and backed off; this does not claim to bypass a server distance check.
 
 ## Add another game
 
@@ -81,7 +84,7 @@ Game scripts should default to stopped, guard their supported place IDs, stop th
 
 ## Validation status
 
-All three Luau files compiled successfully. Loader 1.1.0 passed 40 isolated HTTP/fallback checks using the official portable Luau CLI, without executing live game scripts. Prior isolated game-logic checks also passed (57 egg policy/selection/return-mode checks and 31 restaurant planner checks). The restaurant planner previously selected a valid task from live state in read-only mode. The new executor HTTP path could not be tested live because no Roblox client was injected during the fix. End-to-end live gameplay and server acceptance of the return modes remain unverified.
+All three Luau files compiled successfully. Loader 1.1.0 passed 40 isolated HTTP/fallback checks using the official portable Luau CLI, without executing live game scripts. Egg collector 1.3.0 passed 57 policy/selection/return-mode regression checks, 40 mocked streaming/recovery/guard-route checks and 10 full-script mocked UI/event-wiring checks. The latter verify that the actual Auto toggle stays ON after a slip and that recovery dropdowns stay synchronized; native streaming and server hits were not exercised. The restaurant planner's prior 31 isolated checks also passed, and it previously selected a valid task from live state in read-only mode. No Roblox client was injected during this update, so end-to-end live gameplay, full-region loading and server acceptance of return modes remain unverified.
 
 The 1.1.0 restaurant update additionally passed 10 mocked remote-transport checks covering all eight job methods and rejection/error propagation. Static checks confirm that the restaurant script contains no character-movement or simulated-signal calls. These checks do not establish whether a server accepts a distant task.
 
