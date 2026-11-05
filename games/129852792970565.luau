@@ -1,11 +1,11 @@
--- Egg collector / streaming / recovery / direct stop-point hold or drop (1.4.1).
+-- Egg collector / independent stop-point movement and drop controls (1.5.0).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
 -- No purchase/admin remotes are used. Pickup must be accepted by the server.
 -- Normal teleport buttons require empty hands. Explicit experimental return
 -- modes may teleport a held egg and can cause a server reset; they are not bypasses.
--- Tween-only remains the default. No speed stats/physics flags are changed.
+-- Direct stop-point tween with drop OFF is the default. No speed stats/physics flags are changed.
 
 local PLACE_ID = 129852792970565
 if game.PlaceId ~= PLACE_ID then
@@ -48,7 +48,8 @@ end
 
 local state = {
     alive = true, busy = false, auto = false, epoch = 0, carryLock = false,
-    rarities = table.clone(RARITIES), priority = "Highest rarity first", returnMode = "tween", saved = nil,
+    rarities = table.clone(RARITIES), priority = "Highest rarity first", returnMode = "stop", saved = nil,
+    stopTravel = "tween", dropAtPoint = false,
     snapAfter = 1, snapDistance = 12,
     speedMode = "Match carry speed", customSpeed = 100,
     banks = 0, slips = 0, fault = nil,
@@ -60,7 +61,7 @@ local state = {
     guardRoute = true, skipFastGuards = false, pointPaused = false,
 }
 local app, statusLabel, countLabel, activePrompt, activeTween, autoToggle, speedSlider, returnDelaySlider, returnDistanceSlider
-local returnModeControl, speedModeControl, streamLabel, streamToggle
+local returnModeControl, speedModeControl, streamLabel, streamToggle, stopTravelControl, dropAtPointToggle
 local cacheLoadedEggs, resolveEgg, zoneAllowed, buildGuardRoute, streamStep
 local connections = {}
 local lifetime = Instance.new("BindableFunction")
@@ -184,8 +185,13 @@ local function pauseAuto(message, kind)
             state.resumeAt = os.clock() + SupportPolicy.retryDelay(state.retryDelay, state.failures)
         end
         if (kind == "reset" or kind == "unconfirmed") and state.fallbackOnReset then
-            state.returnMode, state.speedMode = "tween", "Match carry speed"
-            if returnModeControl then returnModeControl:SetValue("tween") end
+            local stopping = state.returnMode == "stop" or tostring(state.returnMode):sub(1,5) == "stop_"
+            state.returnMode, state.speedMode = stopping and "stop" or "tween", "Match carry speed"
+            if stopping then
+                state.stopTravel = "tween"
+                if stopTravelControl then stopTravelControl:SetValue("tween") end
+            end
+            if returnModeControl then returnModeControl:SetValue(state.returnMode) end
             if speedModeControl then speedModeControl:SetValue("Match carry speed") end
             state.fault = message .. " Using tween-only/carry-speed cap for the retry."
         end
@@ -284,7 +290,14 @@ local function stopDestination()
 end
 
 local function stopPointMode(mode)
-    return mode == "stop_hold" or mode == "stop_drop"
+    return mode == "stop" or mode == "stop_hold" or mode == "stop_drop"
+end
+
+local function refreshReturnControls()
+    local movement = stopPointMode(state.returnMode) and (state.stopTravel or "tween") or state.returnMode
+    if returnDelaySlider then returnDelaySlider:Update({Disabled = movement ~= "timed"}) end
+    if returnDistanceSlider then returnDistanceSlider:Update({Disabled = movement ~= "near"}) end
+    if dropAtPointToggle then dropAtPointToggle:Update({Disabled = not stopPointMode(state.returnMode)}) end
 end
 
 local function dropAtStop(id, root, current)
@@ -497,7 +510,7 @@ buildGuardRoute = function(root, goal)
     return {Vector3.new(firstX,goal.Y,lane),Vector3.new(goal.X+28,goal.Y,lane),goal}
 end
 
-local function teleportReturn(id, root, current, mode, bankConfirmed)
+local function teleportReturn(id, root, current, mode, bankConfirmed, destination)
     if not current() then return false, "Return cancelled." end
     if not ReturnPolicy.allowSnap(mode, id, player:GetAttribute("CarryingEgg"), bankConfirmed) then
         return false, "Teleport not authorized by this return mode/carry state."
@@ -506,7 +519,7 @@ local function teleportReturn(id, root, current, mode, bankConfirmed)
     local rotation = root.CFrame - root.Position
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
-    root.CFrame = CFrame.new(bankDestination()) * rotation
+    root.CFrame = CFrame.new(destination or bankDestination()) * rotation
     return true
 end
 
@@ -514,6 +527,9 @@ local function tweenToBank(id, root, humanoid, current)
     local mode = state.returnMode or "tween"
     if mode == "manual" then return false, "Manual return selected; choose another mode to use this button." end
     local stopping = stopPointMode(mode)
+    local movement = stopping and (state.stopTravel or "tween") or mode
+    -- Capture both controls for this action; changes apply to the next return.
+    local dropRequested = mode == "stop_drop" or mode ~= "stop_hold" and state.dropAtPoint == true
     local goal = stopping and stopDestination() or bankDestination()
     -- Stop-point modes always take a straight route to the user's coordinate.
     -- The optional guard-edge detour applies to bank-return modes only.
@@ -540,8 +556,10 @@ local function tweenToBank(id, root, humanoid, current)
         end
         if stopping and remaining < 0.15 then
             cancelTween()
+            -- Let server corrections/carry changes arrive before a post-teleport drop.
+            if snapped and os.clock()-snappedAt < 0.5 then task.wait(0.05); continue end
             root.AssemblyLinearVelocity,root.AssemblyAngularVelocity = Vector3.zero,Vector3.zero
-            if mode == "stop_drop" then return dropAtStop(id,root,current) end
+            if dropRequested then return dropAtStop(id,root,current) end
             return true,"Stopped at point; still holding the egg. No drop or bank requested.","stopped"
         end
         if bankConfirmed and remaining < 0.15 then
@@ -560,11 +578,12 @@ local function tweenToBank(id, root, humanoid, current)
                 return false, "Carry state changed without a complete bank confirmation.", "unconfirmed"
             end
             task.wait(0.05)
-        elseif ReturnPolicy.shouldSnap(mode, os.clock() - started, remaining, bankConfirmed, snapAfter, snapDistance) then
-            local ok, message = teleportReturn(id, root, current, mode, bankConfirmed)
+        elseif ReturnPolicy.shouldSnap(movement, os.clock() - started, remaining, bankConfirmed, snapAfter, snapDistance) then
+            local ok, message = teleportReturn(id, root, current, movement, bankConfirmed, goal)
             if not ok then return false, message end
             snapped, snappedAt = true, os.clock()
-            status("Return teleported once; waiting for bank acknowledgement and destination confirmation.")
+            status(stopping and "Teleported once to stop point; verifying position and held egg before hold/drop."
+                or "Return teleported once; waiting for bank acknowledgement and destination confirmation.")
             task.wait(0.05)
         elseif remaining < 0.15 then
             cancelTween()
@@ -601,7 +620,7 @@ local function tweenToBank(id, root, humanoid, current)
                 if (not bankCleared and (player:GetAttribute("CarryingEgg") ~= id or state.banks > bankBaseline))
                     or state.slips > slipBaseline
                     or (tonumber(player:GetAttribute("RejectCount")) or 0) > rejectBaseline then break end
-                if ReturnPolicy.shouldSnap(mode, os.clock() - started, (goal - root.Position).Magnitude,
+                if ReturnPolicy.shouldSnap(movement, os.clock() - started, (goal - root.Position).Magnitude,
                     bankCleared, snapAfter, snapDistance) then
                     switchToSnap = true
                     break
@@ -750,13 +769,53 @@ local function tweenHeldEgg()
 end
 
 local window = app:CreateWindow({
-    Id = "eggs", Title = "Egg Collector · Streaming & Recovery", Design = "MintGlass",
+    Id = "eggs", Title = "Egg Collector · Movement & Drop · v1.5.0", Design = "MintGlass",
     Size = { 720, 650 }, OpenKey = "RightShift", Wallpaper = false,
     OnClose = cleanup,
 })
 local tab = window:AddTab({ Title = "Eggs" })
 local section = tab:AddSection({ Title = "Select eggs & collect" })
 
+stopTravelControl = section:AddDropdown({
+    Id = "stopTravel", Title = "Movement to stop point", Default = "tween",
+    Options = {
+        {value="tween", label="Tween directly (default)"},
+        {value="instant", label="Teleport instantly (may reset egg)"},
+        {value="timed", label="Tween then teleport (may reset egg)"},
+        {value="near", label="Tween near point then teleport (may reset egg)"},
+    },
+    Callback = function(value)
+        state.stopTravel = value
+        state.pointPaused = false
+        refreshReturnControls()
+        status("Stop-point movement for the next return: "..value..". Stop an active action before switching it.")
+    end,
+})
+dropAtPointToggle = section:AddToggle({Id="dropAtPoint", Title="Drop egg at stop point", Default=false,
+    Callback=function(value)
+        state.dropAtPoint = value
+        status(value and "Drop ON for the next stop-point return. Native chase/drop checks still apply."
+            or "Drop OFF for the next stop-point return: keep holding the egg.")
+    end})
+
+returnModeControl = section:AddDropdown({
+    Id = "returnMode", Title = "Destination / bank mode", Default = "stop",
+    Options = {
+        {value = "stop", label = "Saved stop point — use movement + drop controls"},
+        {value = "tween", label = "Bank: tween only"},
+        {value = "banked", label = "Bank: tween until bank confirmed, then teleport"},
+        {value = "timed", label = "Bank: timed tween → teleport (may reset)"},
+        {value = "near", label = "Bank: tween near target → teleport (may reset)"},
+        {value = "instant", label = "Bank: instant return (may reset)"},
+        {value = "manual", label = "Manual / no automatic return"},
+    },
+    Callback = function(value)
+        state.returnMode = value
+        state.pointPaused = false
+        refreshReturnControls()
+        status("Return mode for the next return: " .. value .. ". Stop + Return current egg to switch an active action.")
+    end,
+})
 local raritySelect = section:AddMultiSelect({
     Id = "rarities", Title = "Rarities (multi-select)", Default = table.clone(RARITIES),
     Options = {
@@ -775,26 +834,6 @@ countLabel = section:AddText({ Text = "Available matching eggs: 0" })
 statusLabel = section:AddParagraph({ Text = "Status: Ready." })
 section:AddButton({ Title = "Teleport to best selected egg (empty hands)", Callback = function() runAction(false) end })
 section:AddButton({ Title = "Get egg + selected return", Variant = "primary", Callback = function() runAction(true) end })
-returnModeControl = section:AddDropdown({
-    Id = "returnMode", Title = "Return mode", Default = "tween",
-    Options = {
-        {value = "tween", label = "Tween only (default)"},
-        {value = "banked", label = "Tween until bank confirmed, then teleport"},
-        {value = "timed", label = "Timed tween → teleport (may reset)"},
-        {value = "near", label = "Tween near target → teleport (may reset)"},
-        {value = "instant", label = "Instant return (may reset)"},
-        {value = "stop_hold", label = "Tween to stop point (hold egg)"},
-        {value = "stop_drop", label = "Tween to stop point → drop egg"},
-        {value = "manual", label = "Manual / no automatic return"},
-    },
-    Callback = function(value)
-        state.returnMode = value
-        state.pointPaused = false
-        if returnDelaySlider then returnDelaySlider:Update({Disabled = value ~= "timed"}) end
-        if returnDistanceSlider then returnDistanceSlider:Update({Disabled = value ~= "near"}) end
-        status("Return mode for the next return: " .. value .. ". Stop + Return current egg to switch an active action.")
-    end,
-})
 autoToggle = section:AddToggle({
     Id = "auto", Title = "Auto collect selected rarities", Default = false,
     Callback = function(value)
@@ -807,7 +846,7 @@ autoToggle = section:AddToggle({
         status(value and ("Auto enabled; priority: " .. state.priority .. ".") or "Auto stopped; active return cancelled.")
     end,
 })
-section:AddParagraph({Text = "Normal teleport buttons require empty hands. Bank modes end at (-208.130, 4.238, 399.946). Stop-point modes tween to (-184.134, 4.238, 397.775), then hold or request a native drop. Auto waits there rather than collecting again. RightShift toggles this menu."})
+section:AddParagraph({Text = "First choose stop-point movement, then Drop ON/OFF. Saved stop point is (-184.134, 4.238, 397.775); Drop OFF keeps the egg, ON requests one native drop there. No left/right detour. Bank modes are separate and ignore the drop toggle. Auto waits after reaching the stop point. RightShift toggles this menu."})
 section:AddButton({Title = "Unload", Callback = cleanup})
 
 local returnSettings = window:AddTab({Title = "Return options"}):AddSection({Title = "Hybrid timing & distance"})
@@ -817,9 +856,10 @@ returnDelaySlider = returnSettings:AddSlider({Id = "snapAfter", Title = "Timed m
 returnDistanceSlider = returnSettings:AddSlider({Id = "snapDistance", Title = "Near-target mode: teleport within studs",
     Min = 1, Max = 200, Step = 1, Default = 12, Disabled = true,
     Callback = function(value) state.snapDistance = value end})
+refreshReturnControls()
 returnSettings:AddParagraph({Text = "Timed mode tweens for the chosen delay, then teleports once. Near-target mode tweens until close enough, then teleports once. Both can teleport a held egg and trigger resets. Bank-confirmed mode never teleports until your own bank event and cleared carry state are observed. Mode/timing changes apply to the next return."})
 returnSettings:AddButton({Title = "Return current egg to selected destination", Callback = tweenHeldEgg})
-returnSettings:AddParagraph({Text = "Stop point: X=-184.1337127685547, Y=4.237677097320557, Z=397.77520751953125. Both stop modes tween directly there without the guard-edge detour. Hold mode never requests a drop. Drop mode waits up to 8s for Chased to clear, sends one normal RequestDropEgg, and checks for the dropped egg nearby. Neither stop mode reports a bank. Auto remains ON but waits here until you change mode, Resume auto or toggle Auto off/on."})
+returnSettings:AddParagraph({Text = "Stop point: X=-184.1337127685547, Y=4.237677097320557, Z=397.77520751953125. Movement and Drop are separate controls on Eggs. Tween travels directly without a guard-edge detour. Teleport/hybrids can reset a held egg. Drop ON waits up to 8s for Chased to clear, sends one normal RequestDropEgg, and checks for the dropped egg nearby; OFF keeps holding. Stop-point completion is not a bank. Controls are captured at action start; Stop + Return current egg applies changes to a held egg. Auto waits here until you change mode, Resume auto or toggle Auto off/on."})
 returnSettings:AddButton({Title = "Stop current action", Callback = function()
     state.epoch = state.epoch + 1
     autoToggle:SetValue(false)
