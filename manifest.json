@@ -3,9 +3,9 @@
   "name": "Roblox Script Hub",
   "games": {
     "129852792970565": {
-      "name": "Egg Teleport",
+      "name": "Egg Collector · Tween Return",
       "path": "games/129852792970565.luau",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "enabled": true
     },
     "104432981439032": {
