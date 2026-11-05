@@ -1,4 +1,4 @@
--- Egg collector / streaming / guard-aware return / recovery (1.3.0).
+-- Egg collector / streaming / recovery / stop-point hold or drop (1.4.0).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
@@ -57,7 +57,7 @@ local state = {
     streamOn = true, streamScope = "All zones", streamTimeout = 2,
     streamBusy = false, streamCursor = 1, streamVisited = {}, streamReady = false,
     nextStreamAt = 0, scanRequested = false, eggCache = {}, cacheTTL = 90,
-    guardRoute = true, skipFastGuards = false,
+    guardRoute = true, skipFastGuards = false, pointPaused = false,
 }
 local app, statusLabel, countLabel, activePrompt, activeTween, autoToggle, speedSlider, returnDelaySlider, returnDistanceSlider
 local returnModeControl, speedModeControl, streamLabel, streamToggle
@@ -279,6 +279,58 @@ local function bankDestination()
     return Vector3.new(-208.12997436523438, 4.237678050994873, 399.94561767578125)
 end
 
+local function stopDestination()
+    return Vector3.new(-184.1337127685547, 4.237677097320557, 397.77520751953125)
+end
+
+local function stopPointMode(mode)
+    return mode == "stop_hold" or mode == "stop_drop"
+end
+
+local function dropAtStop(id, root, current)
+    local banks, slips = state.banks, state.slips
+    local rejects = tonumber(player:GetAttribute("RejectCount")) or 0
+    local function valid()
+        return current() and (root.Position-stopDestination()).Magnitude < 0.75
+            and state.banks == banks and state.slips == slips
+            and (tonumber(player:GetAttribute("RejectCount")) or 0) <= rejects
+    end
+    local untilTime = os.clock()+8
+    while valid() and player:GetAttribute("CarryingEgg") == id and player:GetAttribute("Chased") == true do
+        status("Stopped at point; waiting for chase to end before the normal drop request.")
+        if os.clock() >= untilTime then return false,"Still chased; egg kept. No drop request sent.","stopped" end
+        task.wait(0.1)
+    end
+    if not valid() or player:GetAttribute("CarryingEgg") ~= id then
+        return false,"Stop-point drop cancelled: position/carry state changed.","stopped"
+    end
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local remote = remotes and remotes:FindFirstChild("RequestDropEgg")
+    if not remote or not remote:IsA("RemoteEvent") then return false,"Native drop remote is unavailable; egg kept.","stopped" end
+    local ok, reason = pcall(function() remote:FireServer() end) -- Native action: no arguments, one request only.
+    if not ok then return false,"Drop request failed: "..tostring(reason),"stopped" end
+    untilTime = os.clock()+3
+    repeat
+        if not valid() then return false,"Drop not confirmed: action/position changed. No repeat request.","stopped" end
+        local runtime = workspace:FindFirstChild("Runtime")
+        local dropped = runtime and runtime:FindFirstChild("DroppedEggs")
+        if not carrying() and dropped then
+            for _, egg in ipairs(dropped:GetChildren()) do
+                local holder = egg:GetAttribute("CarriedBy")
+                if (egg:GetAttribute("EggId") or egg.Name) == id and (holder == nil or holder == 0) then
+                    local prompt = pickupPrompt(egg)
+                    local position = prompt and promptPosition(prompt,egg)
+                    if position and (position-stopDestination()).Magnitude < 8 then
+                        return true,"Stopped at point; dropped egg confirmed nearby (not banked).","stopped"
+                    end
+                end
+            end
+        end
+        task.wait(0.1)
+    until os.clock() >= untilTime
+    return false,"Drop request sent once, but a nearby dropped egg was not confirmed. Auto waits here.","stopped"
+end
+
 -- Streaming requests are hints, not a way to disable Roblox's streaming budget.
 local zoneConfig
 pcall(function() zoneConfig = require(ReplicatedStorage.Shared.Config.ZoneConfig) end)
@@ -461,7 +513,8 @@ end
 local function tweenToBank(id, root, humanoid, current)
     local mode = state.returnMode or "tween"
     if mode == "manual" then return false, "Manual return selected; choose another mode to use this button." end
-    local goal = bankDestination()
+    local stopping = stopPointMode(mode)
+    local goal = stopping and stopDestination() or bankDestination()
     local route = state.guardRoute and buildGuardRoute(root,goal) or {goal}
     local routeIndex = 1
     local bankBaseline, slipBaseline = state.banks, state.slips
@@ -480,6 +533,15 @@ local function tweenToBank(id, root, humanoid, current)
             return false, "Server rejected the return; change return mode/speed or return manually.", "reset"
         end
         local remaining = (goal - root.Position).Magnitude
+        if stopping and result ~= "carrying" then
+            cancelTween(); return false,"Stop-point return ended: the expected egg is no longer held.","unconfirmed"
+        end
+        if stopping and remaining < 0.15 then
+            cancelTween()
+            root.AssemblyLinearVelocity,root.AssemblyAngularVelocity = Vector3.zero,Vector3.zero
+            if mode == "stop_drop" then return dropAtStop(id,root,current) end
+            return true,"Stopped at point; still holding the egg. No drop or bank requested.","stopped"
+        end
         if bankConfirmed and remaining < 0.15 then
             cancelTween(); return true, "Bank confirmed; fixed return destination reached."
         end
@@ -561,12 +623,12 @@ end
 local function runAction(collect)
     if not state.alive or state.busy then return end
     if carrying() or state.carryLock then
-        status("Holding an egg: use Return current egg to bank with your selected return mode.")
+        status("Holding an egg: use Return current egg with your selected destination/mode.")
         return
     end
     local character, root, humanoid = characterParts()
     if not root then status("Waiting for a living character."); return end
-    if collect and state.returnMode ~= "manual" and not state.bankSensor then
+    if collect and state.returnMode ~= "manual" and not stopPointMode(state.returnMode) and not state.bankSensor then
         status("Bank feedback remote is not ready. Retry after the game loads."); return
     end
     state.busy = true
@@ -629,8 +691,11 @@ local function runAction(collect)
             state.carryLock = true
             status("Picked up " .. rarity .. " egg. Return mode: " .. state.returnMode .. ".")
             if state.returnMode ~= "manual" and current() then
-                local banked, result, kind = tweenToBank(id, root, humanoid, current)
-                if banked then
+                local completed, result, kind = tweenToBank(id, root, humanoid, current)
+                if kind == "stopped" then
+                    state.pointPaused,state.fault = true,nil
+                    status(result .. " Auto waits; change mode or Resume auto to continue.")
+                elseif completed then
                     state.failures,state.resumeAt,state.fault = 0,0,nil
                     status(result)
                 elseif current() then pauseAuto(state.fault or result,kind) end
@@ -655,7 +720,8 @@ local function tweenHeldEgg()
     local id = player:GetAttribute("CarryingEgg")
     local character, root, humanoid = characterParts()
     if not carrying() or not root then status("No held egg / living character."); return end
-    if not state.bankSensor then status("Bank feedback remote is not ready."); return end
+    if not stopPointMode(state.returnMode) and not state.bankSensor then status("Bank feedback remote is not ready."); return end
+    state.pointPaused = false
     state.busy, state.carryLock, state.fault = true, true, nil
     state.actionSerial = state.actionSerial + 1
     local epoch = state.epoch
@@ -665,12 +731,15 @@ local function tweenHeldEgg()
             and player:GetAttribute("Ragdolled") ~= true
     end
     task.spawn(function()
-        local ok, banked, message, kind = pcall(tweenToBank, id, root, humanoid, current)
+        local ok, completed, message, kind = pcall(tweenToBank, id, root, humanoid, current)
         cancelTween()
         state.busy, state.carryLock = false, carrying()
-        if not ok then pauseAuto("Tween error: " .. tostring(banked),"runtime")
+        if not ok then pauseAuto("Tween error: " .. tostring(completed),"runtime")
         elseif current() then
-            if banked then
+            if kind == "stopped" then
+                state.pointPaused,state.fault = true,nil
+                status(message .. " Auto waits; change mode or Resume auto to continue.")
+            elseif completed then
                 state.failures,state.resumeAt,state.fault = 0,0,nil
                 status(message)
             else pauseAuto(state.fault or message,kind) end
@@ -712,10 +781,13 @@ returnModeControl = section:AddDropdown({
         {value = "timed", label = "Timed tween → teleport (may reset)"},
         {value = "near", label = "Tween near target → teleport (may reset)"},
         {value = "instant", label = "Instant return (may reset)"},
+        {value = "stop_hold", label = "Tween to stop point (hold egg)"},
+        {value = "stop_drop", label = "Tween to stop point → drop egg"},
         {value = "manual", label = "Manual / no automatic return"},
     },
     Callback = function(value)
         state.returnMode = value
+        state.pointPaused = false
         if returnDelaySlider then returnDelaySlider:Update({Disabled = value ~= "timed"}) end
         if returnDistanceSlider then returnDistanceSlider:Update({Disabled = value ~= "near"}) end
         status("Return mode for the next return: " .. value .. ". Stop + Return current egg to switch an active action.")
@@ -727,13 +799,13 @@ autoToggle = section:AddToggle({
         state.auto = value
         state.epoch = state.epoch + 1
         if value then
-            state.fault,state.resumeAt,state.failures,state.recoveredAction = nil,0,0,-1
+            state.fault,state.resumeAt,state.failures,state.recoveredAction,state.pointPaused = nil,0,0,-1,false
             if state.streamOn then state.streamReady,state.streamCursor,state.streamVisited = false,1,{} end
         else state.resumeAt = 0; cancelTween(); endHold() end
         status(value and ("Auto enabled; priority: " .. state.priority .. ".") or "Auto stopped; active return cancelled.")
     end,
 })
-section:AddParagraph({Text = "Normal teleport buttons require empty hands. Return mode selects how a held egg is returned; experimental teleport modes may reset it. All return modes use (-208.130, 4.238, 399.946). RightShift toggles this menu."})
+section:AddParagraph({Text = "Normal teleport buttons require empty hands. Bank modes end at (-208.130, 4.238, 399.946). Stop-point modes tween to (-184.134, 4.238, 397.775), then hold or request a native drop. Auto waits there rather than collecting again. RightShift toggles this menu."})
 section:AddButton({Title = "Unload", Callback = cleanup})
 
 local returnSettings = window:AddTab({Title = "Return options"}):AddSection({Title = "Hybrid timing & distance"})
@@ -744,14 +816,15 @@ returnDistanceSlider = returnSettings:AddSlider({Id = "snapDistance", Title = "N
     Min = 1, Max = 200, Step = 1, Default = 12, Disabled = true,
     Callback = function(value) state.snapDistance = value end})
 returnSettings:AddParagraph({Text = "Timed mode tweens for the chosen delay, then teleports once. Near-target mode tweens until close enough, then teleports once. Both can teleport a held egg and trigger resets. Bank-confirmed mode never teleports until your own bank event and cleared carry state are observed. Mode/timing changes apply to the next return."})
-returnSettings:AddButton({Title = "Return current egg to bank", Callback = tweenHeldEgg})
+returnSettings:AddButton({Title = "Return current egg to selected destination", Callback = tweenHeldEgg})
+returnSettings:AddParagraph({Text = "Stop point: X=-184.1337127685547, Y=4.237677097320557, Z=397.77520751953125. Hold mode never requests a drop. Drop mode waits up to 8s for Chased to clear, sends one normal RequestDropEgg, and checks for the dropped egg nearby. Neither stop mode reports a bank. Auto remains ON but waits here until you change mode, Resume auto or toggle Auto off/on."})
 returnSettings:AddButton({Title = "Stop current action", Callback = function()
     state.epoch = state.epoch + 1
     autoToggle:SetValue(false)
     cancelTween(); endHold()
     status("Action stopped. No further tween/teleport requests will run for this action.")
 end})
-returnSettings:AddParagraph({Text = "Fixed target: X=-208.12997436523438, Y=4.237678050994873, Z=399.94561767578125. A teleport is not counted as a bank unless the server confirms it. No repeated teleport is attempted within a return; recovery waits before a separate pickup attempt."})
+returnSettings:AddParagraph({Text = "Bank target: X=-208.12997436523438, Y=4.237678050994873, Z=399.94561767578125. A teleport is not counted as a bank unless the server confirms it. No repeated teleport is attempted within a return; recovery waits before a separate pickup attempt."})
 
 local settings = window:AddTab({Title = "Speed & selection"}):AddSection({Title = "Tween speed"})
 speedModeControl = settings:AddDropdown({Id = "speedMode", Title = "Tween speed mode", Default = "Match carry speed",
@@ -805,7 +878,7 @@ recovery:AddToggle({Id = "guardRoute", Title = "Guard avoidance: wide corridor r
 recovery:AddToggle({Id = "skipFastGuards", Title = "Skip zones whose base guard speed exceeds return speed", Default = false,
     Callback = function(value) state.skipFastGuards = value end})
 recovery:AddButton({Title = "Resume auto now", Callback = function()
-    state.resumeAt,state.failures,state.fault = 0,0,nil
+    state.resumeAt,state.failures,state.fault,state.pointPaused = 0,0,nil,false
     autoToggle:SetValue(true)
     status("Auto ON; waiting for a living, empty-handed character and any initial zone scan.")
 end})
@@ -856,7 +929,8 @@ task.spawn(function()
             state.carryLock = carrying()
             refreshCount()
             if state.auto then
-                if state.resumeAt > os.clock() then failureStatus()
+                if state.pointPaused then status("Auto ON; stopped at point. Change return mode or Resume auto to continue.")
+                elseif state.resumeAt > os.clock() then failureStatus()
                 elseif player:GetAttribute("Ragdolled") == true then status("Auto ON; waiting for ragdoll recovery.")
                 elseif carrying() then status("Auto ON; waiting for held egg to clear. Use Return current egg if needed.")
                 elseif state.streamOn and not state.streamReady then status("Auto ON; initial zone streaming scan in progress.")
