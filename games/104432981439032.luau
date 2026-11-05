@@ -1,4 +1,4 @@
--- Restaurant Remote Auto Play / MattLib (1.1.0)
+-- Restaurant Remote Auto Play / MattLib (1.1.1)
 -- For Place 104432981439032. Written from the supplied place snapshot.
 -- Uses the same entity actions as the game's interaction controllers.
 -- Remote-only: never teleports, walks, changes physics, or fakes GUI signals.
@@ -9,6 +9,7 @@ if game.PlaceId ~= 104432981439032 then
     warn("[Restaurant Auto Play] Wrong game; expected place 104432981439032.")
     return
 end
+local hubContext = ...
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local player = Players.LocalPlayer
@@ -20,7 +21,12 @@ local Network = require(client:WaitForChild("Network",20))
 local CustomerTypes = require(sharedFolder.Domain.Directory.Entity.CustomerTypes)
 
 local URL = "https://raw.githubusercontent.com/Cybersize/MattLib/81feb71431f2e8ce6aba74c9a8d179c9c74cbf7f/dist/MattLib.lua"
-local downloaded, source = pcall(function() return game:HttpGet(URL) end)
+local downloaded, source = pcall(function()
+    if type(hubContext) == "table" and type(hubContext.httpGet) == "function" then
+        return hubContext.httpGet(URL)
+    end
+    return game:HttpGet(URL)
+end)
 assert(downloaded, "MattLib download failed: " .. tostring(source))
 local loader, compileError = loadstring(source,"MattLib")
 assert(loader,compileError)

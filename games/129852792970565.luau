@@ -1,4 +1,4 @@
--- Egg collector / selectable return modes for Place 129852792970565 (1.2.0).
+-- Egg collector / selectable return modes for Place 129852792970565 (1.2.1).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
@@ -13,6 +13,7 @@ if game.PlaceId ~= PLACE_ID then
     return
 end
 
+local hubContext = ...
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
@@ -21,7 +22,12 @@ local playerGui = player:WaitForChild("PlayerGui")
 
 -- Pin the UI API to the version inspected for this script.
 local LIB_URL = "https://raw.githubusercontent.com/Cybersize/MattLib/81feb71431f2e8ce6aba74c9a8d179c9c74cbf7f/dist/MattLib.lua"
-local downloaded, source = pcall(function() return game:HttpGet(LIB_URL) end)
+local downloaded, source = pcall(function()
+    if type(hubContext) == "table" and type(hubContext.httpGet) == "function" then
+        return hubContext.httpGet(LIB_URL)
+    end
+    return game:HttpGet(LIB_URL)
+end)
 assert(downloaded, "[Egg Teleport] MattLib download failed: " .. tostring(source))
 local loader, compileError = loadstring(source, "MattLib")
 assert(loader, compileError)

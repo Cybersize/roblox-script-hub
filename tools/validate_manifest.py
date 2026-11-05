@@ -22,4 +22,6 @@ for place_id, entry in games.items():
     assert target.stat().st_size <= 2 * 1024 * 1024, f'Script is too large: {path}'
     target.read_text(encoding='utf-8')
 assert (root / 'loader.luau').is_file(), 'Missing loader'
+from build_loader import refresh
+refresh(root, check=True)
 print(f'Validated {len(games)} registered games.')

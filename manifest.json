@@ -5,13 +5,13 @@
     "129852792970565": {
       "name": "Egg Collector · Return Modes",
       "path": "games/129852792970565.luau",
-      "version": "1.2.0",
+      "version": "1.2.1",
       "enabled": true
     },
     "104432981439032": {
       "name": "Restaurant Remote Auto Play",
       "path": "games/104432981439032.luau",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "enabled": true
     }
   }
