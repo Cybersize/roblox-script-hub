@@ -1,4 +1,4 @@
--- Egg teleport / pickup / tween-to-bank for Place 129852792970565 (1.1.0).
+-- Egg teleport / pickup / tween-to-bank for Place 129852792970565 (1.1.1).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
@@ -14,7 +14,6 @@ end
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local CollectionService = game:GetService("CollectionService")
 local TweenService = game:GetService("TweenService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -200,54 +199,23 @@ local function moveRoot(root, destination)
     return true
 end
 
-local function bankDestination(root, humanoid)
-    local line, safe, nearest = nil, nil, math.huge
-    for _, part in ipairs(CollectionService:GetTagged("RedeemLine")) do
-        if part:IsA("BasePart") and part:IsDescendantOf(workspace) then
-            local distance = (part.Position - root.Position).Magnitude
-            if distance < nearest then line, nearest = part, distance end
-        end
-    end
-    if not line then return nil end
-    nearest = math.huge
-    for _, part in ipairs(CollectionService:GetTagged("SafeZone")) do
-        if part:IsA("BasePart") and part:IsDescendantOf(workspace) then
-            local distance = (part.Position - line.Position).Magnitude
-            if distance < nearest then safe, nearest = part, distance end
-        end
-    end
-    if not safe then return nil end
-    local here = line.CFrame:PointToObjectSpace(root.Position)
-    local lobby = line.CFrame:PointToObjectSpace(safe.Position)
-    local height = humanoid.HipHeight + root.Size.Y * 0.5
-    local y = -line.Size.Y * 0.5 + height
-    -- Cross the thin axis toward the actual lobby, not an arbitrary saved CFrame.
-    local point
-    if line.Size.X <= line.Size.Z then
-        local margin = math.max(0, line.Size.Z * 0.5 - 6)
-        point = Vector3.new((lobby.X < 0 and -1 or 1) * (line.Size.X * 0.5 + 8), y,
-            math.clamp(here.Z, -margin, margin))
-    else
-        local margin = math.max(0, line.Size.X * 0.5 - 6)
-        point = Vector3.new(math.clamp(here.X, -margin, margin), y,
-            (lobby.Z < 0 and -1 or 1) * (line.Size.Z * 0.5 + 8))
-    end
-    return line.CFrame:PointToWorldSpace(point)
+local function bankDestination()
+    -- Fixed endpoint requested by the user; shared by automatic/manual returns.
+    return Vector3.new(-208.12997436523438, 4.237678050994873, 399.94561767578125)
 end
 
 local function tweenToBank(id, root, humanoid, current)
-    local goal = bankDestination(root, humanoid)
-    if not goal then return false, "RedeemLine/SafeZone not replicated. Return manually; no instant carry teleport will run." end
+    local goal = bankDestination()
     local bankBaseline, slipBaseline = state.banks, state.slips
     local rejectBaseline = tonumber(player:GetAttribute("RejectCount")) or 0
-    local deadline, clearedAt = os.clock() + 180, nil
+    local deadline, clearedAt, bankConfirmed = os.clock() + 180, nil, false
     while current() and os.clock() < deadline do
         local currentId = player:GetAttribute("CarryingEgg")
         local result = ReturnPolicy.result(id, currentId, state.banks, bankBaseline, state.slips,
             slipBaseline, tonumber(player:GetAttribute("RejectCount")) or 0, rejectBaseline)
-        if result == "banked" then cancelTween(); return true, "Bank confirmed by your EggBanked server event." end
+        if result == "banked" then bankConfirmed = true end
         if result == "rejected" then cancelTween(); return false, "Server rejected the return. Auto paused; reduce tween speed or return manually." end
-        if result == "unconfirmed" or state.banks > bankBaseline then
+        if not bankConfirmed and (result == "unconfirmed" or state.banks > bankBaseline) then
             cancelTween()
             clearedAt = clearedAt or os.clock()
             if os.clock() - clearedAt > 3 then
@@ -259,12 +227,13 @@ local function tweenToBank(id, root, humanoid, current)
             local speed = ReturnPolicy.speed(state.customSpeed, humanoid.WalkSpeed, state.speedMode == "Match carry speed")
             if not speed then return false, "Carry speed is zero; tween stopped." end
             local remaining = (goal - root.Position).Magnitude
-            if remaining < 3 then
+            if remaining < 0.15 then
                 cancelTween()
+                if bankConfirmed then return true, "Bank confirmed; fixed tween destination reached." end
                 local untilTime = os.clock() + 3
                 repeat
                     if not current() then return false, "Return cancelled." end
-                    if state.banks > bankBaseline and not carrying() then return true, "Bank confirmed by your EggBanked server event." end
+                    if state.banks > bankBaseline and not carrying() then return true, "Bank confirmed; fixed tween destination reached." end
                     if state.slips > slipBaseline then return false, "Egg slipped back; auto paused." end
                     task.wait(0.05)
                 until os.clock() >= untilTime
@@ -283,14 +252,15 @@ local function tweenToBank(id, root, humanoid, current)
             tween:Play()
             local expires = os.clock() + duration + 1
             while current() and os.clock() < expires and tween.PlaybackState ~= Enum.PlaybackState.Completed do
-                if player:GetAttribute("CarryingEgg") ~= id or state.banks > bankBaseline
+                local bankCleared = state.banks > bankBaseline and not carrying()
+                if (not bankCleared and (player:GetAttribute("CarryingEgg") ~= id or state.banks > bankBaseline))
                     or state.slips > slipBaseline
                     or (tonumber(player:GetAttribute("RejectCount")) or 0) > rejectBaseline then break end
                 task.wait(0.05)
             end
             cancelTween()
             if not current() then return false, "Return cancelled." end
-            if player:GetAttribute("CarryingEgg") == id and state.banks == bankBaseline
+            if (bankConfirmed or player:GetAttribute("CarryingEgg") == id)
                 and state.slips == slipBaseline
                 and (tonumber(player:GetAttribute("RejectCount")) or 0) <= rejectBaseline
                 and (root.Position - nextPoint).Magnitude > 6 then
@@ -452,7 +422,7 @@ autoToggle = section:AddToggle({
         status(value and ("Auto enabled; priority: " .. state.priority .. ".") or "Auto stopped. No instant return will run.")
     end,
 })
-section:AddParagraph({Text = "Teleport is only used while empty-handed. Returning with an egg uses a linear tween toward the lobby bank, never a snap to your saved position. RightShift toggles this menu."})
+section:AddParagraph({Text = "Teleport is only used while empty-handed. Both return controls target the fixed position (-208.130, 4.238, 399.946), never your saved origin. RightShift toggles this menu."})
 section:AddButton({Title = "Unload", Callback = cleanup})
 
 local settings = window:AddTab({Title = "Tween & selection"}):AddSection({Title = "Return speed"})

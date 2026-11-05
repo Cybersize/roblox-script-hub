@@ -19,11 +19,11 @@ The loader reads `manifest.json`, detects `game.PlaceId`, and loads only that ga
 
 **RightShift** hides/shows either menu. The restaurant script starts stopped; press **Start all** to enable its duties. Cooking uses the game's normal timers. Ingredient farming, purchases, spawning customers and staff configuration are not included.
 
-### Egg collector (1.1.0)
+### Egg collector (1.1.1)
 
 - Select multiple rarities. **Highest rarity first** is the default; eggs of equal rarity are ordered by distance. Empty selection targets nothing. **Nearest selected** is also available.
 - An egg pickup is acknowledged through the player's `CarryingEgg` attribute before returning. Instant teleport buttons are blocked while carrying, including the previous-position button.
-- Return uses a linear tween toward the actual lobby side of `RedeemLine`, not an instant jump to the saved origin. The script waits for the local player's `EggBanked` server event and cleared carry state; clearing `CarryingEgg` alone is not reported as success.
+- Automatic and manual returns both tween to the fixed endpoint `Vector3.new(-208.12997436523438, 4.237678050994873, 399.94561767578125)`, not the saved origin. A bank acknowledgement does not stop the tween short of that endpoint. A successful return still requires the local player's `EggBanked` server event and cleared carry state; clearing `CarryingEgg` alone is not reported as success. Cancellation, corrections and rejections can still stop a return.
 - **Tween & selection → Match carry speed** defaults to 90% of the current Humanoid.WalkSpeed. Choose **Custom speed (may reset)** to use the 10–250 studs/second slider for a faster tween. The script does not change WalkSpeed, collision, anchoring or network settings. Server checks may still reject a tween, especially at higher speeds; this is not a guaranteed reset bypass.
 - Slips, guard catches, rejection-counter increases, blocked movement and unconfirmed banks pause auto-collect. **Stop current action** and **Unload** cancel an active tween.
 
@@ -56,7 +56,7 @@ Game scripts should default to stopped, guard their supported place IDs, stop th
 
 ## Validation status
 
-All three Luau files compiled successfully. The universal loader passed 17 isolated routing/error-handling checks without executing gameplay. Isolated game-logic tests also passed (32 egg 1.1.0 policy/selection/tween checks and 31 restaurant planner checks). The restaurant planner selected a valid task from the live state in read-only mode. End-to-end live gameplay, including server acceptance of the new tween return, has not been verified.
+All three Luau files compiled successfully. The universal loader passed 17 isolated routing/error-handling checks without executing gameplay. Isolated game-logic tests also passed (33 egg 1.1.1 policy/selection/tween checks and 31 restaurant planner checks). The restaurant planner selected a valid task from the live state in read-only mode. End-to-end live gameplay, including server acceptance of the new tween return, has not been verified.
 
 The 1.1.0 restaurant update additionally passed 10 mocked remote-transport checks covering all eight job methods and rejection/error propagation. Static checks confirm that the restaurant script contains no character-movement or simulated-signal calls. These checks do not establish whether a server accepts a distant task.
 
