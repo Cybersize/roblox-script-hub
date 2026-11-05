@@ -1,4 +1,4 @@
--- Egg collector / streaming / recovery / stop-point hold or drop (1.4.0).
+-- Egg collector / streaming / recovery / direct stop-point hold or drop (1.4.1).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
@@ -515,7 +515,9 @@ local function tweenToBank(id, root, humanoid, current)
     if mode == "manual" then return false, "Manual return selected; choose another mode to use this button." end
     local stopping = stopPointMode(mode)
     local goal = stopping and stopDestination() or bankDestination()
-    local route = state.guardRoute and buildGuardRoute(root,goal) or {goal}
+    -- Stop-point modes always take a straight route to the user's coordinate.
+    -- The optional guard-edge detour applies to bank-return modes only.
+    local route = not stopping and state.guardRoute and buildGuardRoute(root,goal) or {goal}
     local routeIndex = 1
     local bankBaseline, slipBaseline = state.banks, state.slips
     local rejectBaseline = tonumber(player:GetAttribute("RejectCount")) or 0
@@ -817,7 +819,7 @@ returnDistanceSlider = returnSettings:AddSlider({Id = "snapDistance", Title = "N
     Callback = function(value) state.snapDistance = value end})
 returnSettings:AddParagraph({Text = "Timed mode tweens for the chosen delay, then teleports once. Near-target mode tweens until close enough, then teleports once. Both can teleport a held egg and trigger resets. Bank-confirmed mode never teleports until your own bank event and cleared carry state are observed. Mode/timing changes apply to the next return."})
 returnSettings:AddButton({Title = "Return current egg to selected destination", Callback = tweenHeldEgg})
-returnSettings:AddParagraph({Text = "Stop point: X=-184.1337127685547, Y=4.237677097320557, Z=397.77520751953125. Hold mode never requests a drop. Drop mode waits up to 8s for Chased to clear, sends one normal RequestDropEgg, and checks for the dropped egg nearby. Neither stop mode reports a bank. Auto remains ON but waits here until you change mode, Resume auto or toggle Auto off/on."})
+returnSettings:AddParagraph({Text = "Stop point: X=-184.1337127685547, Y=4.237677097320557, Z=397.77520751953125. Both stop modes tween directly there without the guard-edge detour. Hold mode never requests a drop. Drop mode waits up to 8s for Chased to clear, sends one normal RequestDropEgg, and checks for the dropped egg nearby. Neither stop mode reports a bank. Auto remains ON but waits here until you change mode, Resume auto or toggle Auto off/on."})
 returnSettings:AddButton({Title = "Stop current action", Callback = function()
     state.epoch = state.epoch + 1
     autoToggle:SetValue(false)
@@ -873,7 +875,7 @@ recovery:AddSlider({Id = "retryDelay", Title = "Base retry cooldown (seconds)", 
     Callback = function(value) state.retryDelay = value end})
 recovery:AddToggle({Id = "fallbackOnReset", Title = "After reset: use tween-only + carry-speed cap", Default = true,
     Callback = function(value) state.fallbackOnReset = value end})
-recovery:AddToggle({Id = "guardRoute", Title = "Guard avoidance: wide corridor route", Default = true,
+recovery:AddToggle({Id = "guardRoute", Title = "Bank modes only: guard-avoidance corridor route", Default = true,
     Callback = function(value) state.guardRoute = value end})
 recovery:AddToggle({Id = "skipFastGuards", Title = "Skip zones whose base guard speed exceeds return speed", Default = false,
     Callback = function(value) state.skipFastGuards = value end})
