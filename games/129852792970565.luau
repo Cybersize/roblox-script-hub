@@ -1,4 +1,4 @@
--- Egg collector / independent stop-point movement and drop controls (1.5.0).
+-- Egg collector / direct returns / independent movement and drop controls (1.5.1).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
@@ -53,16 +53,16 @@ local state = {
     snapAfter = 1, snapDistance = 12,
     speedMode = "Match carry speed", customSpeed = 100,
     banks = 0, slips = 0, fault = nil,
-    autoRecover = true, retryDelay = 5, fallbackOnReset = true, resumeAt = 0,
+    autoRecover = true, retryDelay = 5, resumeAt = 0,
     failures = 0, actionSerial = 0, recoveredAction = -1,
     streamOn = true, streamScope = "All zones", streamTimeout = 2,
     streamBusy = false, streamCursor = 1, streamVisited = {}, streamReady = false,
     nextStreamAt = 0, scanRequested = false, eggCache = {}, cacheTTL = 90,
-    guardRoute = true, skipFastGuards = false, pointPaused = false,
+    skipFastGuards = false, pointPaused = false,
 }
 local app, statusLabel, countLabel, activePrompt, activeTween, autoToggle, speedSlider, returnDelaySlider, returnDistanceSlider
 local returnModeControl, speedModeControl, streamLabel, streamToggle, stopTravelControl, dropAtPointToggle
-local cacheLoadedEggs, resolveEgg, zoneAllowed, buildGuardRoute, streamStep
+local cacheLoadedEggs, resolveEgg, zoneAllowed, streamStep
 local connections = {}
 local lifetime = Instance.new("BindableFunction")
 lifetime.Name = LIFETIME_NAME
@@ -184,17 +184,8 @@ local function pauseAuto(message, kind)
             state.failures = state.failures + 1
             state.resumeAt = os.clock() + SupportPolicy.retryDelay(state.retryDelay, state.failures)
         end
-        if (kind == "reset" or kind == "unconfirmed") and state.fallbackOnReset then
-            local stopping = state.returnMode == "stop" or tostring(state.returnMode):sub(1,5) == "stop_"
-            state.returnMode, state.speedMode = stopping and "stop" or "tween", "Match carry speed"
-            if stopping then
-                state.stopTravel = "tween"
-                if stopTravelControl then stopTravelControl:SetValue("tween") end
-            end
-            if returnModeControl then returnModeControl:SetValue(state.returnMode) end
-            if speedModeControl then speedModeControl:SetValue("Match carry speed") end
-            state.fault = message .. " Using tween-only/carry-speed cap for the retry."
-        end
+        -- Recovery never rewrites user-selected movement, speed, drop or rarity
+        -- settings. GuardCatch / RejectCount / Notify can overlap in any order.
         failureStatus()
     else
         state.auto = false
@@ -490,26 +481,6 @@ resolveEgg = function(current)
     return findEgg()
 end
 
-buildGuardRoute = function(root, goal)
-    if not state.guardRoute or root.Position.X <= goal.X+40 then return {goal} end
-    local center, width = 400, zoneConfig and zoneConfig.Corridor and zoneConfig.Corridor.WidthStuds or 160
-    local low, high = center-width*0.5+12, center+width*0.5-12
-    local lane = root.Position.Z < center and low or high
-    local runtime = workspace:FindFirstChild("Runtime")
-    local guards = runtime and runtime:FindFirstChild("Guards")
-    local nearest, nearestPosition = math.huge, nil
-    if guards then for _, guard in ipairs(guards:GetChildren()) do
-        local part = guard:FindFirstChild("HumanoidRootPart") or guard.PrimaryPart
-        if part and part:IsA("BasePart") then
-            local distance = (part.Position-root.Position).Magnitude
-            if distance < nearest then nearest,nearestPosition = distance,part.Position end
-        end
-    end end
-    if nearestPosition then lane = nearestPosition.Z < center and high or low end
-    local firstX = math.max(goal.X+28,root.Position.X-24)
-    return {Vector3.new(firstX,goal.Y,lane),Vector3.new(goal.X+28,goal.Y,lane),goal}
-end
-
 local function teleportReturn(id, root, current, mode, bankConfirmed, destination)
     if not current() then return false, "Return cancelled." end
     if not ReturnPolicy.allowSnap(mode, id, player:GetAttribute("CarryingEgg"), bankConfirmed) then
@@ -531,10 +502,7 @@ local function tweenToBank(id, root, humanoid, current)
     -- Capture both controls for this action; changes apply to the next return.
     local dropRequested = mode == "stop_drop" or mode ~= "stop_hold" and state.dropAtPoint == true
     local goal = stopping and stopDestination() or bankDestination()
-    -- Stop-point modes always take a straight route to the user's coordinate.
-    -- The optional guard-edge detour applies to bank-return modes only.
-    local route = not stopping and state.guardRoute and buildGuardRoute(root,goal) or {goal}
-    local routeIndex = 1
+    -- Every mode heads straight to its chosen finish point. No edge waypoints.
     local bankBaseline, slipBaseline = state.banks, state.slips
     local rejectBaseline = tonumber(player:GetAttribute("RejectCount")) or 0
     local started = os.clock()
@@ -602,8 +570,7 @@ local function tweenToBank(id, root, humanoid, current)
             local speed = ReturnPolicy.speed(state.customSpeed, humanoid.WalkSpeed, state.speedMode == "Match carry speed")
             if not speed then return false, "Carry speed is zero; tween stopped.", "blocked" end
             local origin = root.Position
-            while routeIndex < #route and (route[routeIndex]-origin).Magnitude < 2 do routeIndex = routeIndex+1 end
-            local waypoint = route[routeIndex]
+            local waypoint = goal
             local legDistance = (waypoint-origin).Magnitude
             local nextPoint = origin:Lerp(waypoint, math.min(1, 24 / math.max(legDistance,0.01)))
             local direction = Vector3.new(waypoint.X - nextPoint.X, 0, waypoint.Z - nextPoint.Z)
@@ -769,7 +736,7 @@ local function tweenHeldEgg()
 end
 
 local window = app:CreateWindow({
-    Id = "eggs", Title = "Egg Collector · Movement & Drop · v1.5.0", Design = "MintGlass",
+    Id = "eggs", Title = "Egg Collector · Direct Returns · v1.5.1", Design = "MintGlass",
     Size = { 720, 650 }, OpenKey = "RightShift", Wallpaper = false,
     OnClose = cleanup,
 })
@@ -908,15 +875,11 @@ streaming:AddButton({Title = "Scan zones now (no teleport)", Callback = function
 end})
 streaming:AddParagraph({Text = "Uses Player:RequestStreamAroundAsync, scans one region at a time and caches egg hints. A cached egg is streamed/revalidated before teleporting to its real prompt. Roblox can stream distant regions out again; this cannot force a permanent all-map render."})
 
-local recovery = window:AddTab({Title = "Recovery"}):AddSection({Title = "Reset handling & guard avoidance"})
+local recovery = window:AddTab({Title = "Recovery"}):AddSection({Title = "Reset handling & guard-speed filtering"})
 recovery:AddToggle({Id = "autoRecover", Title = "Keep auto ON: cooldown and retry after resets", Default = true,
     Callback = function(value) state.autoRecover = value end})
 recovery:AddSlider({Id = "retryDelay", Title = "Base retry cooldown (seconds)", Min = 2, Max = 30, Step = 1, Default = 5,
     Callback = function(value) state.retryDelay = value end})
-recovery:AddToggle({Id = "fallbackOnReset", Title = "After reset: use tween-only + carry-speed cap", Default = true,
-    Callback = function(value) state.fallbackOnReset = value end})
-recovery:AddToggle({Id = "guardRoute", Title = "Bank modes only: guard-avoidance corridor route", Default = true,
-    Callback = function(value) state.guardRoute = value end})
 recovery:AddToggle({Id = "skipFastGuards", Title = "Skip zones whose base guard speed exceeds return speed", Default = false,
     Callback = function(value) state.skipFastGuards = value end})
 recovery:AddButton({Title = "Resume auto now", Callback = function()
@@ -924,7 +887,7 @@ recovery:AddButton({Title = "Resume auto now", Callback = function()
     autoToggle:SetValue(true)
     status("Auto ON; waiting for a living, empty-handed character and any initial zone scan.")
 end})
-recovery:AddParagraph({Text = "Slips/catches/rejections now keep Auto enabled with increasing cooldowns (up to 60s). Runtime errors or disabling recovery still switch it off. A held egg must clear or be returned before another pickup. Wide-lane routing and speed filtering are avoidance only: they do not cancel server boss hits or grant invulnerability."})
+recovery:AddParagraph({Text = "Slips/catches/rejections keep Auto enabled with increasing cooldowns (up to 60s), without changing your movement, destination, speed, drop, rarity or other settings. Forced tween/carry-speed fallback has been removed. Runtime errors or disabling recovery still switch Auto off. A held egg must clear or be returned before another pickup. All returns head directly to their finish point; no left/right detour. Optional guard-speed filtering does not cancel boss hits or grant invulnerability."})
 
 local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
 local effects = remotes and remotes:WaitForChild("PlayEffect", 10)
