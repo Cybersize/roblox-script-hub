@@ -30,12 +30,14 @@ The executor must be injected in the current Roblox client. If all HTTP transpor
 
 | Place ID | Script | Features |
 | --- | --- | --- |
-| `129852792970565` | [Egg Collector · Streaming & Recovery](games/129852792970565.luau) | Multi-select rarity priority, independent tween/teleport movement and drop controls, region requests, reset recovery and guard-aware routing |
+| `129852792970565` | [Egg Collector · Streaming & Recovery](games/129852792970565.luau) | Config-driven rarity priority including Celestial, nine-zone scanning, independent movement/drop controls and settings-preserving recovery |
 | `104432981439032` | [Restaurant Remote Auto Play](games/104432981439032.luau) | Remote-only seat assignment, orders, cooking/collecting, serving, table clearing and dishwashing; no character movement |
 
 **RightShift** hides/shows either menu. The restaurant script starts stopped; press **Start all** to enable its duties. Cooking uses the game's normal timers. Ingredient farming, purchases, spawning customers and staff configuration are not included.
 
-### Egg collector (1.5.1)
+### Egg collector (1.6.0)
+
+Updated for the Nov 8 game snapshot and read-only live place version 624. Celestial is now included above Divine, and zone 9 (Cherry Paw Heavens) is covered by the fallback streaming geometry. The script reads the live `RarityConfig.List` for spawning, non-paid rarities, their display labels and priority scores; its fallback includes all twelve currently spawning world rarities. Paid-only Exclusive remains excluded. Zone fallback guard speeds are updated for zones 7/8/9 (163/180/200). Core pickup/drop/bank-feedback interfaces are unchanged in the compared client sources. Existing direct paths, stop/bank coordinates, Drop toggle and settings-preserving recovery are retained; new shop, upgrade, daily and hatch actions are not automated by this compatibility update.
 
 The Eggs tab starts with independent movement and drop controls:
 
@@ -54,7 +56,7 @@ The Eggs tab starts with independent movement and drop controls:
 - **Streaming** uses native `Player:RequestStreamAroundAsync` without moving the character. Choose all/unlocked zones, a 1–5 second timeout or **Scan zones now (no teleport)**. Auto waits for an initial sweep. Recent egg hints are re-streamed and checked against real eggs/prompts before travel. Distant regions can unload again; this does not guarantee permanent whole-map rendering. Already-loaded eggs remain usable if region requests fail.
 - Every tween return interpolates directly toward its chosen finish point, with no left/right lane waypoint. The optional faster-base-guard filter remains off by default; it does not change the path or cancel boss hits, and it does not model all possible guard acceleration/attacks.
 
-Default rarity order: Divine → Super Secret → Secret → Ascendant → Exotic → Relic → Mythic → Legendary → Epic → Rare → Common. Exclusive is paid-only and is not included among world-spawn eggs.
+Default rarity order: Celestial → Divine → Super Secret → Secret → Ascendant → Exotic → Relic → Mythic → Legendary → Epic → Rare → Common. Exclusive is paid-only and is not included among world-spawn eggs.
 
 ### Restaurant remote-only mode (1.1.1)
 
@@ -84,7 +86,7 @@ Game scripts should default to stopped, guard their supported place IDs, stop th
 
 ## Validation status
 
-All three Luau files compiled successfully. Loader 1.1.0 passed 40 isolated HTTP/fallback checks using the official portable Luau CLI, without executing live game scripts. Egg collector 1.5.1 passed 57 policy/selection/return-mode regression checks, 38 mocked streaming/recovery/guard-filter checks, 74 direct-return/movement/drop checks and 25 full-script mocked UI/event-wiring checks. These cover straight-line bank and stop-point paths from both corridor sides, all four stop-point movement choices with Drop ON/OFF, exact coordinates, one-shot drops, capture of choices at action start, chase/cancel/rejection handling, distinct drop-vs-bank confirmation, actual dropdown/toggle wiring, Auto waiting after a drop and unchanged user settings across catch/rejection/slip/respawn recovery. Native streaming, server hits and the real drop remote were not exercised. The restaurant planner's prior 31 isolated checks also passed, and it previously selected a valid task from live state in read-only mode. A read-only check detected the active game at place version 612 during this fix. The player was carrying an egg, so the current collector was not interrupted or reloaded. No live steal/return/drop test was performed; end-to-end gameplay, full-region loading and server acceptance of return/drop modes remain unverified.
+All three Luau files compiled successfully. Loader 1.1.0 passed 40 isolated HTTP/fallback checks using the official portable Luau CLI, without executing live game scripts. Egg collector 1.6.0 passed 61 policy/selection/return-mode regression checks, 43 mocked streaming/recovery/guard-filter checks, 74 direct-return/movement/drop checks, 26 full-script mocked UI/event-wiring checks and 16 new rarity/config compatibility checks. These cover straight-line bank and stop-point paths from both corridor sides, all four stop-point movement choices with Drop ON/OFF, exact coordinates, one-shot drops, capture of choices at action start, chase/cancel/rejection handling, distinct drop-vs-bank confirmation, actual dropdown/toggle wiring, Auto waiting after a drop and unchanged user settings across catch/rejection/slip/respawn recovery. Native streaming, server hits and the real drop remote were not exercised. The restaurant planner's prior 31 isolated checks also passed, and it previously selected a valid task from live state in read-only mode. The new snapshot was parsed without executing saved code (159,756 instances, 239 serialized scripts). Read-only live checks at place version 624 confirmed twelve eligible world rarities, Celestial priority above Divine, nine configured zones and unchanged core remote classes; the new rarity policy was evaluated against the actual config without moving or collecting anything. The new map LOD controller excludes Runtime and was not disabled. No live steal/return/drop test or collector reload was performed; full-region residency and server acceptance remain unverified.
 
 The 1.1.0 restaurant update additionally passed 10 mocked remote-transport checks covering all eight job methods and rejection/error propagation. Static checks confirm that the restaurant script contains no character-movement or simulated-signal calls. These checks do not establish whether a server accepts a distant task.
 

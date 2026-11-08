@@ -1,4 +1,4 @@
--- Egg collector / direct returns / independent movement and drop controls (1.5.1).
+-- Egg collector / Celestial + zone 9 / direct returns / preserved settings (1.6.0).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
@@ -34,9 +34,42 @@ local loader, compileError = loadstring(source, "MattLib")
 assert(loader, compileError)
 local MattLib = loader()
 
-local RARITIES = {"Common", "Rare", "Epic", "Legendary", "Mythic", "Relic", "Exotic", "Ascendant", "Secret", "SuperSecret", "Divine"}
+-- RARITY_POLICY_BEGIN
+local RarityPolicy = {}
+function RarityPolicy.build(config)
+    if type(config) ~= "table" or type(config.List) ~= "table" then return nil end
+    local rows, seen = {}, {}
+    for _, item in ipairs(config.List) do
+        if type(item) == "table" and type(item.Key) == "string" and item.Key ~= ""
+            and item.Spawns == true and item.PaidOnly ~= true and not seen[item.Key] then
+            seen[item.Key] = true
+            rows[#rows+1] = {key=item.Key,label=type(item.DisplayName)=="string" and item.DisplayName or item.Key,
+                rank=tonumber(item.SortOrder) or tonumber(item.Rank) or 0}
+        end
+    end
+    if #rows == 0 then return nil end
+    table.sort(rows,function(a,b) return a.rank < b.rank or a.rank == b.rank and a.key < b.key end)
+    local keys, ranks, options = {}, {}, {}
+    for _, row in ipairs(rows) do
+        keys[#keys+1],ranks[row.key] = row.key,row.rank
+        options[#options+1] = {value=row.key,label=row.label}
+    end
+    return keys,ranks,options
+end
+-- RARITY_POLICY_END
+
+local RARITIES = {"Common", "Rare", "Epic", "Legendary", "Mythic", "Relic", "Exotic", "Ascendant", "Secret", "SuperSecret", "Divine", "Celestial"}
 local RARITY_RANK = {}
-for rank, name in ipairs(RARITIES) do RARITY_RANK[name] = rank end
+local RARITY_OPTIONS = {}
+for rank, name in ipairs(RARITIES) do
+    RARITY_RANK[name] = rank
+    RARITY_OPTIONS[#RARITY_OPTIONS+1] = {value=name,label=name=="SuperSecret" and "Super Secret" or name}
+end
+pcall(function()
+    local config = require(ReplicatedStorage.Shared.Config.RarityConfig)
+    local keys,ranks,options = RarityPolicy.build(config)
+    if keys then RARITIES,RARITY_RANK,RARITY_OPTIONS = keys,ranks,options end
+end)
 
 -- An instance-backed cleanup handle also works across separate executor chunks.
 local LIFETIME_NAME = "MattEggTeleport_Lifecycle"
@@ -345,8 +378,9 @@ local zoneDefinitions = zoneConfig and zoneConfig.Zones or {
     {Index=4,LengthStuds=520,NestOffsetStuds=365,RequiredSpeed=170000,GuardSpeed=78},
     {Index=5,LengthStuds=730,NestOffsetStuds=510,RequiredSpeed=2500000,GuardSpeed=110.5},
     {Index=6,LengthStuds=870,NestOffsetStuds=610,RequiredSpeed=18000000,GuardSpeed=136},
-    {Index=7,LengthStuds=676,NestOffsetStuds=470,RequiredSpeed=150000000,GuardSpeed=160},
-    {Index=8,LengthStuds=900,NestOffsetStuds=630,RequiredSpeed=1000000000,GuardSpeed=163},
+    {Index=7,LengthStuds=676,NestOffsetStuds=470,RequiredSpeed=150000000,GuardSpeed=163},
+    {Index=8,LengthStuds=900,NestOffsetStuds=630,RequiredSpeed=1000000000,GuardSpeed=180},
+    {Index=9,LengthStuds=900,NestOffsetStuds=630,RequiredSpeed=5000000000,GuardSpeed=200},
 }
 local zoneByIndex = {}
 for _, zone in ipairs(zoneDefinitions) do zoneByIndex[zone.Index] = zone end
@@ -736,7 +770,7 @@ local function tweenHeldEgg()
 end
 
 local window = app:CreateWindow({
-    Id = "eggs", Title = "Egg Collector · Direct Returns · v1.5.1", Design = "MintGlass",
+    Id = "eggs", Title = "Egg Collector · Celestial / Zone 9 · v1.6.0", Design = "MintGlass",
     Size = { 720, 650 }, OpenKey = "RightShift", Wallpaper = false,
     OnClose = cleanup,
 })
@@ -785,10 +819,7 @@ returnModeControl = section:AddDropdown({
 })
 local raritySelect = section:AddMultiSelect({
     Id = "rarities", Title = "Rarities (multi-select)", Default = table.clone(RARITIES),
-    Options = {
-        "Common", "Rare", "Epic", "Legendary", "Mythic", "Relic",
-        "Exotic", "Ascendant", "Secret", { value = "SuperSecret", label = "Super Secret" }, "Divine",
-    },
+    Options = RARITY_OPTIONS,
     Callback = function(values)
         state.rarities = table.clone(values)
         refreshCount()
