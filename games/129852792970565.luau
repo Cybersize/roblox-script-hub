@@ -1,4 +1,4 @@
--- Egg collector / Celestial + zone 9 / direct returns / preserved settings (1.6.0).
+-- Egg collector / instant retry / Celestial + zone 9 / preserved settings (1.6.1).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
@@ -86,7 +86,7 @@ local state = {
     snapAfter = 1, snapDistance = 12,
     speedMode = "Match carry speed", customSpeed = 100,
     banks = 0, slips = 0, fault = nil,
-    autoRecover = true, retryDelay = 5, resumeAt = 0,
+    autoRecover = true, retryDelay = 0, resumeAt = 0,
     failures = 0, actionSerial = 0, recoveredAction = -1,
     streamOn = true, streamScope = "All zones", streamTimeout = 2,
     streamBusy = false, streamCursor = 1, streamVisited = {}, streamReady = false,
@@ -130,8 +130,10 @@ lifetime.Parent = playerGui
 
 app = MattLib.new({ id = "matt-egg-teleport", theme = "Dark", reducedMotion = true })
 
+local lastStatusMessage
 local function status(message)
-    if state.alive and statusLabel then
+    if state.alive and statusLabel and message ~= lastStatusMessage then
+        lastStatusMessage = message
         statusLabel:Update({ Text = "Status: " .. message })
     end
 end
@@ -183,8 +185,9 @@ end
 
 -- SUPPORT_POLICY_BEGIN
 local SupportPolicy = {}
-function SupportPolicy.retryDelay(base, failures)
-    return math.min(60, math.max(2, base) * 2 ^ math.min(math.max(failures - 1, 0), 4))
+function SupportPolicy.retryDelay(base, _failures)
+    -- No escalating backoff. Zero means ready as soon as the action clears.
+    return math.clamp(tonumber(base) or 0, 0, 30)
 end
 function SupportPolicy.recoverable(kind)
     return kind == "reset" or kind == "guard" or kind == "respawn" or kind == "unconfirmed" or kind == "blocked" or kind == "timeout"
@@ -203,6 +206,7 @@ end
 local function failureStatus()
     if state.auto and state.resumeAt > os.clock() then
         status(string.format("Auto ON; retry in %.0fs. %s", state.resumeAt-os.clock(), state.fault or "Recovering."))
+    elseif state.auto and state.fault then status("Auto ON; retry ready. " .. state.fault)
     elseif state.fault then status(state.fault) end
 end
 
@@ -770,7 +774,7 @@ local function tweenHeldEgg()
 end
 
 local window = app:CreateWindow({
-    Id = "eggs", Title = "Egg Collector · Celestial / Zone 9 · v1.6.0", Design = "MintGlass",
+    Id = "eggs", Title = "Egg Collector · Instant Retry · v1.6.1", Design = "MintGlass",
     Size = { 720, 650 }, OpenKey = "RightShift", Wallpaper = false,
     OnClose = cleanup,
 })
@@ -907,10 +911,14 @@ end})
 streaming:AddParagraph({Text = "Uses Player:RequestStreamAroundAsync, scans one region at a time and caches egg hints. A cached egg is streamed/revalidated before teleporting to its real prompt. Roblox can stream distant regions out again; this cannot force a permanent all-map render."})
 
 local recovery = window:AddTab({Title = "Recovery"}):AddSection({Title = "Reset handling & guard-speed filtering"})
-recovery:AddToggle({Id = "autoRecover", Title = "Keep auto ON: cooldown and retry after resets", Default = true,
+recovery:AddToggle({Id = "autoRecover", Title = "Keep auto ON: retry after resets", Default = true,
     Callback = function(value) state.autoRecover = value end})
-recovery:AddSlider({Id = "retryDelay", Title = "Base retry cooldown (seconds)", Min = 2, Max = 30, Step = 1, Default = 5,
-    Callback = function(value) state.retryDelay = value end})
+recovery:AddSlider({Id = "retryDelay", Title = "Retry delay (0 = instantly)", Min = 0, Max = 30, Step = 0.1, Default = 0,
+    Callback = function(value)
+        state.retryDelay = value
+        state.resumeAt = math.min(state.resumeAt,os.clock()+value)
+        if state.auto then failureStatus() end
+    end})
 recovery:AddToggle({Id = "skipFastGuards", Title = "Skip zones whose base guard speed exceeds return speed", Default = false,
     Callback = function(value) state.skipFastGuards = value end})
 recovery:AddButton({Title = "Resume auto now", Callback = function()
@@ -918,7 +926,7 @@ recovery:AddButton({Title = "Resume auto now", Callback = function()
     autoToggle:SetValue(true)
     status("Auto ON; waiting for a living, empty-handed character and any initial zone scan.")
 end})
-recovery:AddParagraph({Text = "Slips/catches/rejections keep Auto enabled with increasing cooldowns (up to 60s), without changing your movement, destination, speed, drop, rarity or other settings. Forced tween/carry-speed fallback has been removed. Runtime errors or disabling recovery still switch Auto off. A held egg must clear or be returned before another pickup. All returns head directly to their finish point; no left/right detour. Optional guard-speed filtering does not cancel boss hits or grant invulnerability."})
+recovery:AddParagraph({Text = "Default retry delay is 0s: no increasing backoff or 60-second timer. Auto checks every 0.05s and starts the next attempt once the old action ends, the character is alive/not ragdolled and no egg is held. An optional fixed delay can be selected above. Recovery preserves your settings. Runtime errors or disabling recovery still stop Auto. Returns go straight to the finish point; filtering does not cancel boss hits or grant invulnerability."})
 
 local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
 local effects = remotes and remotes:WaitForChild("PlayEffect", 10)
@@ -960,10 +968,14 @@ end)
 
 refreshCount()
 task.spawn(function()
+    local nextCountRefresh = 0
     while state.alive do
         if not state.busy then
             state.carryLock = carrying()
-            refreshCount()
+            if os.clock() >= nextCountRefresh then
+                refreshCount()
+                nextCountRefresh = os.clock()+1
+            end
             if state.auto then
                 if state.pointPaused then status("Auto ON; stopped at point. Change return mode or Resume auto to continue.")
                 elseif state.resumeAt > os.clock() then failureStatus()
@@ -973,7 +985,7 @@ task.spawn(function()
                 else runAction(true) end
             end
         end
-        task.wait(2)
+        task.wait(state.auto and 0.05 or 0.5)
     end
 end)
 
