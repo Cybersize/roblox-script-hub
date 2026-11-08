@@ -1,11 +1,12 @@
--- Egg collector / hybrid controls / faster custom tween / v629 config (1.7.0).
+-- Egg helper / simple Main + Settings / optional owned-item tasks (1.8.0).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
 -- No purchase/admin remotes are used. Pickup must be accepted by the server.
 -- Normal teleport buttons require empty hands. Explicit experimental return
 -- modes can teleport a held egg only with protection OFF and may reset it.
--- Direct stop-point tween with drop OFF is the default. No speed stats/physics flags are changed.
+-- Direct bank tween is the default; the saved drop point remains available.
+-- No purchases, paid skips, selling, speed stats or physics flags are changed.
 
 local PLACE_ID = 129852792970565
 if game.PlaceId ~= PLACE_ID then
@@ -81,7 +82,9 @@ end
 
 local state = {
     alive = true, busy = false, auto = false, epoch = 0, carryLock = false,
-    rarities = table.clone(RARITIES), priority = "Highest rarity first", returnMode = "stop", saved = nil,
+    automationBusy=false, automationRetryAt=0,
+    rarities = table.clone(RARITIES), priority = "Highest rarity first", returnMode = "tween", saved = nil,
+    destination = "bank", autoTasks = {"collect","train","hatch","place","equip"},
     stopTravel = "tween", dropAtPoint = false,
     protectHeldEgg = true,
     snapAfter = 1, snapDistance = 12,
@@ -95,8 +98,9 @@ local state = {
     skipFastGuards = false, pointPaused = false,
 }
 local app, statusLabel, countLabel, activePrompt, activeTween, autoToggle, speedSlider, returnDelaySlider, returnDistanceSlider
-local returnModeControl, speedModeControl, streamLabel, streamToggle, stopTravelControl, dropAtPointToggle
+local destinationControl, streamLabel, stopTravelControl, dropAtPointToggle
 local cacheLoadedEggs, resolveEgg, zoneAllowed, streamStep
+local automationStep, automationCleanup, stopIdleTraining
 local connections = {}
 local lifetime = Instance.new("BindableFunction")
 lifetime.Name = LIFETIME_NAME
@@ -119,6 +123,7 @@ local function cleanup()
     if not state.alive then return end
     state.alive, state.auto = false, false
     state.epoch = state.epoch + 1
+    if automationCleanup then pcall(automationCleanup) end
     cancelTween()
     endHold()
     for _, connection in ipairs(connections) do connection:Disconnect() end
@@ -147,6 +152,30 @@ local function characterParts()
         return character, root, humanoid
     end
 end
+
+local function isRagdolled()
+    local character=player.Character
+    return player:GetAttribute("Ragdolled")==true
+        or character~=nil and character:GetAttribute("Ragdolled")==true
+end
+
+local function taskSelected(key)
+    return table.find(state.autoTasks,key)~=nil
+end
+
+-- UI_POLICY_BEGIN
+local UiPolicy = {}
+function UiPolicy.returnMode(destination, movement)
+    if destination=="manual" then return "manual" end
+    if destination=="bank" then return movement end
+    return "stop"
+end
+function UiPolicy.speed(value)
+    local speed=tonumber(value) or 0
+    if speed<=0 then return "Match carry speed",250 end
+    return "Custom speed (may reset)",math.clamp(speed,10,1000)
+end
+-- UI_POLICY_END
 
 local function carrying()
     local id = player:GetAttribute("CarryingEgg")
@@ -295,9 +324,7 @@ end
 local function refreshCount()
     local _, _, count = findEgg()
     if state.alive and countLabel then
-        local cached = 0
-        for _ in pairs(state.eggCache) do cached = cached+1 end
-        countLabel:Update({ Text = "Loaded eligible eggs: " .. tostring(count) .. " | Cached region hints: " .. cached })
+        countLabel:Update({ Text = "Eggs: " .. tostring(count) })
     end
 end
 
@@ -654,8 +681,9 @@ end
 
 local function runAction(collect)
     if not state.alive or state.busy then return end
+    if state.automationBusy then status("Finishing an auto task…");return end
     if carrying() or state.carryLock then
-        status("Holding an egg: use Return current egg with your selected destination/mode.")
+        status("Holding an egg. Press Get egg to return it.")
         return
     end
     local character, root, humanoid = characterParts()
@@ -671,7 +699,7 @@ local function runAction(collect)
     local function current()
         return state.alive and state.epoch == epoch and player.Character == character
             and root.Parent == character and humanoid.Health > 0
-            and player:GetAttribute("Ragdolled") ~= true
+            and not isRagdolled()
     end
     task.spawn(function()
         local ok, reason = xpcall(function()
@@ -726,7 +754,7 @@ local function runAction(collect)
                 local completed, result, kind = tweenToBank(id, root, humanoid, current)
                 if kind == "stopped" then
                     state.pointPaused,state.fault = true,nil
-                    status(result .. " Auto waits; change mode or Resume auto to continue.")
+                    status(result .. " Auto paused at finish.")
                 elseif completed then
                     state.failures,state.resumeAt,state.fault = 0,0,nil
                     status(result)
@@ -748,6 +776,7 @@ end
 
 local function tweenHeldEgg()
     if not state.alive or state.busy then return end
+    if state.automationBusy then status("Finishing an auto task…");return end
     if state.returnMode == "manual" then status("Manual return selected. Choose another return mode first."); return end
     local id = player:GetAttribute("CarryingEgg")
     local character, root, humanoid = characterParts()
@@ -760,7 +789,7 @@ local function tweenHeldEgg()
     local function current()
         return state.alive and state.epoch == epoch and player.Character == character
             and root.Parent == character and humanoid.Health > 0
-            and player:GetAttribute("Ragdolled") ~= true
+            and not isRagdolled()
     end
     task.spawn(function()
         local ok, completed, message, kind = pcall(tweenToBank, id, root, humanoid, current)
@@ -770,7 +799,7 @@ local function tweenHeldEgg()
         elseif current() then
             if kind == "stopped" then
                 state.pointPaused,state.fault = true,nil
-                status(message .. " Auto waits; change mode or Resume auto to continue.")
+                status(message .. " Auto paused at finish.")
             elseif completed then
                 state.failures,state.resumeAt,state.fault = 0,0,nil
                 status(message)
@@ -779,166 +808,633 @@ local function tweenHeldEgg()
     end)
 end
 
-local window = app:CreateWindow({
-    Id = "eggs", Title = "Egg Collector · Hybrid / Fast Tween · v1.7.0", Design = "MintGlass",
-    Size = { 720, 650 }, OpenKey = "RightShift", Wallpaper = false,
-    OnClose = cleanup,
-})
-local tab = window:AddTab({ Title = "Eggs" })
-local section = tab:AddSection({ Title = "Select eggs & collect" })
-
-stopTravelControl = section:AddDropdown({
-    Id = "stopTravel", Title = "Movement to stop point", Default = "tween",
-    Options = {
-        {value="tween", label="Tween directly (default)"},
-        {value="instant", label="Teleport instantly (may reset egg)"},
-        {value="timed", label="Tween then teleport (may reset egg)"},
-        {value="near", label="Tween near point then teleport (may reset egg)"},
-    },
-    Callback = function(value)
-        state.stopTravel = value
-        state.pointPaused = false
-        refreshReturnControls()
-        status("Stop-point movement for the next return: "..value..". Stop an active action before switching it.")
-    end,
-})
-dropAtPointToggle = section:AddToggle({Id="dropAtPoint", Title="Drop egg at stop point", Default=false,
-    Callback=function(value)
-        state.dropAtPoint = value
-        status(value and "Drop ON for the next stop-point return. Native chase/drop checks still apply."
-            or "Drop OFF for the next stop-point return: keep holding the egg.")
-    end})
-
-returnModeControl = section:AddDropdown({
-    Id = "returnMode", Title = "Destination / bank mode", Default = "stop",
-    Options = {
-        {value = "stop", label = "Saved stop point — use movement + drop controls"},
-        {value = "tween", label = "Bank: tween only"},
-        {value = "banked", label = "Bank: tween until bank confirmed, then teleport"},
-        {value = "timed", label = "Bank: timed tween → teleport (may reset)"},
-        {value = "near", label = "Bank: tween near target → teleport (may reset)"},
-        {value = "instant", label = "Bank: instant return (may reset)"},
-        {value = "manual", label = "Manual / no automatic return"},
-    },
-    Callback = function(value)
-        state.returnMode = value
-        state.pointPaused = false
-        refreshReturnControls()
-        status("Return mode for the next return: " .. value .. ". Stop + Return current egg to switch an active action.")
-    end,
-})
-local raritySelect = section:AddMultiSelect({
-    Id = "rarities", Title = "Rarities (multi-select)", Default = table.clone(RARITIES),
-    Options = RARITY_OPTIONS,
-    Callback = function(values)
-        state.rarities = table.clone(values)
-        refreshCount()
-        status(tostring(#values) .. " rarities selected. Highest rarity first by default.")
-    end,
-})
-section:AddDropdown({Id = "priority", Title = "Priority", Default = "Highest rarity first",
-    Options = {"Highest rarity first", "Nearest selected"}, Callback = function(value) state.priority = value end})
-countLabel = section:AddText({ Text = "Available matching eggs: 0" })
-statusLabel = section:AddParagraph({ Text = "Status: Ready." })
-section:AddButton({ Title = "Teleport to best selected egg (empty hands)", Callback = function() runAction(false) end })
-section:AddButton({ Title = "Get egg + selected return", Variant = "primary", Callback = function() runAction(true) end })
-autoToggle = section:AddToggle({
-    Id = "auto", Title = "Auto collect selected rarities", Default = false,
-    Callback = function(value)
-        state.auto = value
-        state.epoch = state.epoch + 1
-        if value then
-            state.fault,state.resumeAt,state.failures,state.recoveredAction,state.pointPaused = nil,0,0,-1,false
-            if state.streamOn then state.streamReady,state.streamCursor,state.streamVisited = false,1,{} end
-        else state.resumeAt = 0; cancelTween(); endHold() end
-        status(value and ("Auto enabled; priority: " .. state.priority .. ".") or "Auto stopped; active return cancelled.")
-    end,
-})
-section:AddParagraph({Text = "Choose movement and Drop ON/OFF. Protection ON (Return options) blocks held-egg teleports: returns finish by direct tween instead, even if a teleport/hybrid mode is selected. Saved stop point is (-184.134, 4.238, 397.775); Drop OFF keeps the egg, ON requests one native drop there. Bank modes ignore Drop. Auto waits at the stop point. RightShift toggles the menu."})
-section:AddButton({Title = "Unload", Callback = cleanup})
-
-local returnSettings = window:AddTab({Title = "Return options"}):AddSection({Title = "Hybrid timing & distance"})
-returnDelaySlider = returnSettings:AddSlider({Id = "snapAfter", Title = "Timed mode: tween seconds before teleport",
-    Min = 0.25, Max = 10, Step = 0.25, Default = 1, Disabled = true,
-    Callback = function(value) state.snapAfter = value end})
-returnDistanceSlider = returnSettings:AddSlider({Id = "snapDistance", Title = "Near-target mode: teleport within studs",
-    Min = 1, Max = 200, Step = 1, Default = 12, Disabled = true,
-    Callback = function(value) state.snapDistance = value end})
-refreshReturnControls()
-returnSettings:AddToggle({Id="protectHeldEgg", Title="Protect held egg: tween instead of teleport", Default=true,
-    Callback=function(value)
-        state.protectHeldEgg = value
-        status(value and "Protection ON for next return: no teleport while holding an egg; complete by tween."
-            or "Protection OFF for next return: experimental held-egg teleports may reset the egg.")
-    end})
-returnSettings:AddParagraph({Text = "Protection is ON by default. Timed/near/instant return modes keep tweening while the egg is held instead of making the rejected jump. A teleport is allowed only with empty hands and the required bank confirmation. At the stop point, Drop OFF keeps holding; Drop ON requests the normal drop. Protection does not bypass server checks or guarantee fast-tween acceptance. Turn it OFF only to restore experimental carried-egg jumps. Changes apply to the next return."})
-returnSettings:AddButton({Title = "Return current egg to selected destination", Callback = tweenHeldEgg})
-returnSettings:AddParagraph({Text = "Stop point: X=-184.1337127685547, Y=4.237677097320557, Z=397.77520751953125. Movement and Drop are separate controls on Eggs. Tween travels directly without a guard-edge detour. Teleport/hybrids can reset a held egg. Drop ON waits up to 8s for Chased to clear, sends one normal RequestDropEgg, and checks for the dropped egg nearby; OFF keeps holding. Stop-point completion is not a bank. Controls are captured at action start; Stop + Return current egg applies changes to a held egg. Auto waits here until you change mode, Resume auto or toggle Auto off/on."})
-returnSettings:AddButton({Title = "Stop current action", Callback = function()
-    state.epoch = state.epoch + 1
-    autoToggle:SetValue(false)
-    cancelTween(); endHold()
-    status("Action stopped. No further tween/teleport requests will run for this action.")
-end})
-returnSettings:AddParagraph({Text = "Bank target: X=-208.12997436523438, Y=4.237678050994873, Z=399.94561767578125. A teleport is not counted as a bank unless the server confirms it. No repeated teleport is attempted within a return; recovery waits before a separate pickup attempt."})
-
-local settings = window:AddTab({Title = "Speed & selection"}):AddSection({Title = "Tween speed"})
-speedModeControl = settings:AddDropdown({Id = "speedMode", Title = "Tween speed mode", Default = "Match carry speed",
-    Options = {"Match carry speed", "Custom speed (may reset)"}, Callback = function(value)
-        state.speedMode = value
-        if speedSlider then speedSlider:Update({Disabled = value == "Match carry speed"}) end
-    end})
-speedSlider = settings:AddSlider({Id = "customSpeed", Title = "Custom tween speed (studs/sec)",
-    Min = 10, Max = 1000, Step = 5, Default = 250, Disabled = true,
-    Callback = function(value) state.customSpeed = value end})
-settings:AddParagraph({Text = "Match carry speed uses 90% of current Humanoid.WalkSpeed. To tween faster, select Custom speed and choose 10–1000 studs/sec (default 250). High speeds can reset the egg or be corrected by the server; this does not raise server-authorized movement speed. No stats, collision, anchoring or network settings are changed. Retry delay defaults to 0s and recovery preserves your selected settings."})
-settings:AddButton({ Title = "Return previous position (empty hands only)", Callback = function()
-    if state.busy then return end
-    local _, root = characterParts()
-    if root and state.saved then
-        local ok, reason = moveRoot(root, state.saved)
-        if not ok then status(reason) end
+local InventoryPolicy = (function()
+-- PURE planner only. Does not require game services or fire any remotes.
+-- snapshot: raw SnapshotController:Get() table with .items array/map.
+-- flags: {hatch,place,equip} booleans.
+-- context: now, remainingById?, pendingUntilById?, ranks?, eggCap,
+-- lastEquipAt?, lastEquipSignature?, manualPlacementActive?,
+-- candidate?={ownPlot=true,validated=true,x,z,yaw?,distance,itemId?}.
+-- Candidate geometry/range must be obtained from the native Placement API.
+-- All returned actions are unconfirmed requests, not reported game successes.
+-- INVENTORY_POLICY_BEGIN
+local InventoryPolicy = {}
+local function finite(n)
+    return type(n)=="number" and n==n and n>-math.huge and n<math.huge
+end
+local function items(snapshot)
+    return type(snapshot)=="table" and type(snapshot.items)=="table" and snapshot.items or {}
+end
+local function usable(item,context)
+    if type(item)~="table" or type(item.id)~="string" or item.id=="" then return false end
+    local untilAt=context.pendingUntilById and context.pendingUntilById[item.id]
+    return not finite(untilAt) or untilAt<=(context.now or 0)
+end
+local function bestEgg(snapshot,context,predicate)
+    local best,bestRank=nil,-math.huge
+    for _,item in pairs(items(snapshot)) do
+        if usable(item,context) and item.kind=="Egg" and predicate(item) then
+            local rank=context.ranks and tonumber(context.ranks[item.rarity]) or 0
+            rank=finite(rank) and rank or 0
+            if not best or rank>bestRank or rank==bestRank and item.id<best.id then
+                best,bestRank=item,rank
+            end
+        end
     end
-end })
-settings:AddButton({Title = "Select all rarities", Callback = function() raritySelect:SetValue(table.clone(RARITIES)) end})
-settings:AddButton({Title = "Clear rarity selection", Callback = function() raritySelect:SetValue({}) end})
+    return best
+end
+function InventoryPolicy.placedEggCount(snapshot)
+    local count=0
+    for _,item in pairs(items(snapshot)) do
+        if type(item)=="table" and item.kind=="Egg" and item.placed=="floor" then count+=1 end
+    end
+    return count
+end
+function InventoryPolicy.hatch(snapshot,context)
+    local egg=bestEgg(snapshot,context,function(item)
+        local remaining=context.remainingById and context.remainingById[item.id]
+        if remaining==nil then remaining=item.growRemaining end
+        return item.placed=="floor" and finite(remaining) and remaining<=0
+    end)
+    if not egg then return nil,"No ready placed egg" end
+    return {kind="hatch",remote="RequestHatchEgg",itemId=egg.id,payload={itemId=egg.id}}
+end
+function InventoryPolicy.place(snapshot,context)
+    if context.manualPlacementActive then return nil,"Manual placement active" end
+    local cap=context.eggCap
+    if not finite(cap) or cap<0 then return nil,"Egg capacity unknown" end
+    if InventoryPolicy.placedEggCount(snapshot)>=cap then return nil,"Egg spaces full" end
+    local egg=bestEgg(snapshot,context,function(item)
+        return (item.placed==nil or item.placed=="") and item.id~=context.heldItemId
+    end)
+    if not egg then return nil,"No unplaced owned egg" end
+    local spot=context.candidate
+    if type(spot)~="table" or spot.ownPlot~=true or spot.validated~=true
+        or not finite(spot.x) or not finite(spot.z) or not finite(spot.distance)
+        or spot.distance<0 or spot.distance>60 or (spot.itemId and spot.itemId~=egg.id)
+        or (spot.yaw~=nil and not finite(spot.yaw)) then
+        return nil,"Need validated nearby own-plot space",egg
+    end
+    return {kind="place",remote="RequestPlaceAt",itemId=egg.id,
+        payload={itemId=egg.id,x=spot.x,z=spot.z,yaw=spot.yaw or 0}}
+end
+function InventoryPolicy.equipSignature(snapshot)
+    local rows={}
+    for _,item in pairs(items(snapshot)) do
+        if type(item)=="table" and item.kind=="Catboy" and type(item.id)=="string" and item.id~="" then
+            rows[#rows+1]=item.id..":"..tostring(item.catboyId or "")..":"..tostring(item.mutation or "")
+        end
+    end
+    table.sort(rows)
+    return #rows>0 and table.concat(rows,"|") or nil
+end
+function InventoryPolicy.equip(snapshot,context)
+    if context.manualPlacementActive then return nil,"Manual placement active" end
+    local signature=InventoryPolicy.equipSignature(snapshot)
+    if not signature then return nil,"No owned catboys" end
+    if signature==context.lastEquipSignature then return nil,"Best already requested for this inventory" end
+    if (context.now or 0)-(context.lastEquipAt or -math.huge)<2.1 then return nil,"Equip debounce" end
+    return {kind="equip",remote="RequestEquipBest",payload={},signature=signature}
+end
+function InventoryPolicy.plan(snapshot,flags,context)
+    if type(snapshot)~="table" or type(snapshot.items)~="table" then return nil,"Inventory not ready" end
+    if context.manualPlacementActive then return nil,"Manual placement active" end
+    if flags.hatch then local action=InventoryPolicy.hatch(snapshot,context);if action then return action end end
+    if flags.equip then local action=InventoryPolicy.equip(snapshot,context);if action then return action end end
+    if flags.place then return InventoryPolicy.place(snapshot,context) end
+    return nil,"No inventory task ready"
+end
+-- INVENTORY_POLICY_END
+return InventoryPolicy
 
-local streaming = window:AddTab({Title = "Streaming"}):AddSection({Title = "Progressive region loading"})
-streamLabel = streaming:AddParagraph({Text = "Region requests do not guarantee the whole map stays rendered."})
-streamToggle = streaming:AddToggle({Id = "streamOn", Title = "Request zones before auto collection", Default = true, Callback = function(value)
-    state.streamOn = value
-    state.streamReady,state.streamCursor,state.streamVisited = not value,1,{}
-    if not value then state.scanRequested = false end
-end})
-streaming:AddDropdown({Id = "streamScope", Title = "Zones to scan", Default = "All zones", Options = {"All zones","Unlocked zones"},
-    Callback = function(value) state.streamScope = value; state.streamReady,state.streamCursor,state.streamVisited = false,1,{} end})
-streaming:AddSlider({Id = "streamTimeout", Title = "Region request timeout (seconds)", Min = 1, Max = 5, Step = 1, Default = 2,
-    Callback = function(value) state.streamTimeout = value end})
-streaming:AddButton({Title = "Scan zones now (no teleport)", Callback = function()
-    if carrying() then status("Finish the held egg first; region scanning waits while carrying."); return end
-    streamToggle:SetValue(true)
-    state.streamOn,state.scanRequested,state.streamReady,state.streamCursor,state.streamVisited = true,true,false,1,{}
-    status("Zone scan queued. No character movement is used to request regions.")
-end})
-streaming:AddParagraph({Text = "Uses Player:RequestStreamAroundAsync, scans one region at a time and caches egg hints. A cached egg is streamed/revalidated before teleporting to its real prompt. Roblox can stream distant regions out again; this cannot force a permanent all-map render."})
+end)()
 
-local recovery = window:AddTab({Title = "Recovery"}):AddSection({Title = "Reset handling & guard-speed filtering"})
-recovery:AddToggle({Id = "autoRecover", Title = "Keep auto ON: retry after resets", Default = true,
-    Callback = function(value) state.autoRecover = value end})
-recovery:AddSlider({Id = "retryDelay", Title = "Retry delay (0 = instantly)", Min = 0, Max = 30, Step = 0.1, Default = 0,
-    Callback = function(value)
-        state.retryDelay = value
-        state.resumeAt = math.min(state.resumeAt,os.clock()+value)
-        if state.auto then failureStatus() end
-    end})
-recovery:AddToggle({Id = "skipFastGuards", Title = "Skip zones whose base guard speed exceeds return speed", Default = false,
-    Callback = function(value) state.skipFastGuards = value end})
-recovery:AddButton({Title = "Resume auto now", Callback = function()
-    state.resumeAt,state.failures,state.fault,state.pointPaused = 0,0,nil,false
-    autoToggle:SetValue(true)
-    status("Auto ON; waiting for a living, empty-handed character and any initial zone scan.")
+local TrainingPolicy = (function()
+-- Pure scheduling/geometry policy. No Roblox calls or actions.
+-- Context: enabled, trainEnabled, busy, alive, holdingEgg, chased, ragdolled,
+-- sitting, finishPaused, collectEnabled, eligibleEgg, pendingEggHint, onTreadmill.
+local TrainingPolicy = {}
+
+function TrainingPolicy.ready(context)
+    if not context.enabled or not context.trainEnabled then return false,"disabled" end
+    if context.busy then return false,"busy" end
+    if not context.alive then return false,"character-unavailable" end
+    if context.holdingEgg then return false,"holding-egg" end
+    if context.chased then return false,"chased" end
+    if context.ragdolled then return false,"ragdolled" end
+    if context.sitting then return false,"sitting" end
+    if context.finishPaused then return false,"finish-paused" end
+    if context.collectEnabled and (context.eligibleEgg or context.pendingEggHint) then return false,"egg-priority" end
+    if context.onTreadmill then return false,"already-training" end
+    return true,"idle"
+end
+
+function TrainingPolicy.ownTarget(baseIndex, plotSlot, ownerUserId, localUserId)
+    return type(baseIndex)=="number" and type(plotSlot)=="number"
+        and plotSlot>0 and plotSlot%1==0 and baseIndex==plotSlot
+        and type(ownerUserId)=="number" and ownerUserId>0 and ownerUserId==localUserId
+end
+
+function TrainingPolicy.standingOffset(partHeight, hipHeight, rootHeight)
+    if type(partHeight)~="number" or partHeight<=0 or partHeight~=partHeight then return nil end
+    if type(hipHeight)~="number" or hipHeight<0 or hipHeight~=hipHeight then return nil end
+    if type(rootHeight)~="number" or rootHeight<=0 or rootHeight~=rootHeight then return nil end
+    if partHeight==math.huge or hipHeight==math.huge or rootHeight==math.huge then return nil end
+    -- R15 uses hip height + half root. Floor of 3 also accommodates ordinary R6.
+    return partHeight*0.5+math.max(3,hipHeight+rootHeight*0.5)+0.1
+end
+
+function TrainingPolicy.insideBelt(x,y,z,sizeX,sizeY,sizeZ)
+    return math.abs(x)<=sizeX*0.5+0.5 and math.abs(z)<=sizeZ*0.5+0.5
+        and y>=0 and y<=sizeY*0.5+6
+end
+
+function TrainingPolicy.canLeave(context)
+    return context.alive==true and context.ownTargetValid==true and context.atTrainingPosition==true
+        and not context.busy and not context.holdingEgg and not context.chased
+        and not context.ragdolled and not context.sitting and not context.moving
+end
+
+function TrainingPolicy.offBeltOffsets(sizeX,sizeZ)
+    if type(sizeX)~="number" or type(sizeZ)~="number" or sizeX<=0 or sizeZ<=0
+        or sizeX~=sizeX or sizeZ~=sizeZ or sizeX==math.huge or sizeZ==math.huge then return nil end
+    -- Offsets are in belt-local X/Z. Caller must transform them into world space,
+    -- reject points outside the OWN floor, and check a safe floor/landing exists.
+    return {{x=sizeX*0.5+2,z=0},{x=-sizeX*0.5-2,z=0},
+        {x=0,z=sizeZ*0.5+2},{x=0,z=-sizeZ*0.5-2}}
+end
+
+function TrainingPolicy.withinOwnFloor(localX,localZ,sizeX,sizeZ,margin)
+    local gap=math.max(1,tonumber(margin) or 2)
+    return math.abs(localX)<=sizeX*0.5-gap and math.abs(localZ)<=sizeZ*0.5-gap
+end
+
+return TrainingPolicy
+
+end)()
+
+local InventoryRuntime = (function()
+-- READ-ONLY runtime adapter for the inspected v629 client.
+-- Requires InventoryPolicy from egg_inventory_policy.luau to be in scope.
+-- No FireServer/InvokeServer, input, movement, purchases or item mutation.
+-- memory fields updated by the caller AFTER dispatch: pendingUntilById,
+-- lastEquipAt, lastEquipSignature. This adapter only caches module references.
+local InventoryRuntime = {}
+
+local function module(parent,name)
+    local found=parent and parent:FindFirstChild(name)
+    if not found or not found:IsA("ModuleScript") then return nil end
+    local ok,result=pcall(require,found)
+    return ok and type(result)=="table" and result or nil
+end
+
+function InventoryRuntime.read(player,memory,ranks,flags)
+    local rs=game:GetService("ReplicatedStorage")
+    local cs=game:GetService("CollectionService")
+    local shared=rs:FindFirstChild("Shared")
+    local config=shared and shared:FindFirstChild("Config")
+    local util=shared and shared:FindFirstChild("Util")
+    local scripts=player:FindFirstChild("PlayerScripts")
+    local client=scripts and scripts:FindFirstChild("Client")
+    local controllers=client and client:FindFirstChild("Controllers")
+    local modules=memory.modules
+    if not modules then
+        modules={snapshot=module(controllers,"SnapshotController"),
+            placement=module(controllers,"PlacementController"),
+            geometry=module(util,"Placement"),config=module(config,"PlacementConfig"),
+            constants=module(shared,"Constants")}
+        if not modules.snapshot or not modules.placement or not modules.geometry
+            or not modules.config or not modules.constants then return nil,nil,{reason="Client inventory not ready"} end
+        memory.modules=modules
+    end
+    local ok,snapshot=pcall(modules.snapshot.Get,modules.snapshot)
+    if not ok or type(snapshot)~="table" or type(snapshot.items)~="table" then
+        return nil,nil,{reason="Inventory snapshot not ready"}
+    end
+    local context={now=os.clock(),ranks=ranks,eggCap=tonumber(player:GetAttribute("EggCap")),
+        remainingById={},pendingUntilById=memory.pendingUntilById or {},
+        lastEquipAt=memory.lastEquipAt,lastEquipSignature=memory.lastEquipSignature}
+    local meta={snapshot=snapshot,readyAnchorCount=0}
+    local api,geom,cfg,constants=modules.placement,modules.geometry,modules.config,modules.constants
+    local activeOK,active=pcall(api.IsActive,api)
+    context.manualPlacementActive=activeOK and active==true
+    local heldOK,held=pcall(api.GetItemId,api)
+    context.heldItemId=heldOK and held or nil
+    if memory.ownedPlacementId and context.heldItemId==memory.ownedPlacementId then
+        context.manualPlacementActive,context.heldItemId=false,nil
+    end
+
+    -- Raw snapshot timers can be stale for many minutes. Replicated owned
+    -- placed anchors carry State and ReadyAt; use server-confirmed Ready state.
+    for _,item in pairs(snapshot.items) do
+        if type(item)=="table" and item.kind=="Egg" and item.placed=="floor" and type(item.id)=="string" then
+            context.remainingById[item.id]=math.huge
+        end
+    end
+    local ownedAnchors={}
+    for _,part in ipairs(cs:GetTagged(constants.Tag.Placed or "Placed")) do
+        if part:IsA("BasePart") and part:IsDescendantOf(workspace)
+            and part:GetAttribute(constants.Attr.OwnerUserId or "OwnerUserId")==player.UserId then
+            ownedAnchors[#ownedAnchors+1]=part
+            if part:GetAttribute(constants.Attr.ItemKind or "ItemKind")=="Egg" then
+                local id=part:GetAttribute(constants.Attr.ItemId or "ItemId")
+                if type(id)=="string" and part:GetAttribute(constants.Attr.State or "State")=="Ready" then
+                    context.remainingById[id]=0
+                    meta.readyAnchorCount+=1
+                end
+            end
+        end
+    end
+    if not flags.place then return snapshot,context,meta end
+    local baseOK,base=pcall(api.GetBase,api)
+    if not baseOK or not base or not base:IsA("Model") or not base:IsDescendantOf(workspace)
+        or base:GetAttribute(constants.Attr.OwnerUserId or "OwnerUserId")~=player.UserId then
+        meta.reason="Own plot is not ready";return snapshot,context,meta
+    end
+    local floor=base:FindFirstChild(constants.BasePart.Floor or "Floor")
+    local encoded=base:GetAttribute(constants.Attr.PlacementArea or "PlacementArea")
+    if not floor or not floor:IsA("BasePart") or type(encoded)~="string" then
+        meta.reason="Own floor is not ready";return snapshot,context,meta
+    end
+    local decoded,area=pcall(geom.Decode,encoded)
+    if not decoded or type(area)~="table" then
+        meta.reason="Own placement geometry is not ready";return snapshot,context,meta
+    end
+    meta.floor=floor
+    local frame=geom.BaseFrame(floor)
+    local character=player.Character
+    local root=character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+    local spawn=base:FindFirstChild(constants.BasePart.Spawn or "Spawn",true)
+    if root and root:IsA("BasePart") and humanoid then
+        local x,z=0,0
+        if spawn and spawn:IsA("BasePart") then x,z=geom.ToLocal(frame,spawn.Position) end
+        meta.maintenancePosition=geom.ToWorld(frame,x,z,0).Position
+            +Vector3.new(0,humanoid.HipHeight+root.Size.Y*0.5,0)
+    end
+    local _,reason,pending=InventoryPolicy.place(snapshot,context)
+    if not pending then meta.reason=reason;return snapshot,context,meta end
+    local anchors={}
+    for _,part in ipairs(ownedAnchors) do
+        local x,z=geom.ToLocal(frame,part.Position)
+        anchors[#anchors+1]={X=x,Z=z,R=part:GetAttribute(constants.Attr.Radius or "Radius") or cfg.Spacing.EggRadius,
+            Id=part:GetAttribute(constants.Attr.ItemId or "ItemId")}
+    end
+    local radius=geom.EggRadius()
+    local found,x,z=pcall(geom.FindFree,area,0,0,radius,anchors,pending.id)
+    if not found or type(x)~="number" or type(z)~="number" then
+        meta.reason="No empty placement space";return snapshot,context,meta
+    end
+    local validOK,valid=pcall(geom.Validate,area,x,z,radius,anchors,pending.id)
+    if not validOK or valid~=true then meta.reason="No validated placement space";return snapshot,context,meta end
+    local worldPoint=geom.ToWorld(frame,x,z,0).Position
+    context.candidate={ownPlot=true,validated=true,itemId=pending.id,x=x,z=z,yaw=0,
+        distance=root and root:IsA("BasePart") and (root.Position-worldPoint).Magnitude or math.huge}
+    meta.needsMaintenanceTrip=context.candidate.distance>(cfg.ClickRangeStuds or 60)
+    meta.base=base
+    return snapshot,context,meta
+end
+return InventoryRuntime
+
+end)()
+
+-- Owned-item/idle-training adapter. All requests are opt-in through Auto tasks.
+local serviceMemory={pendingUntilById={},autoHatchUntil={},nextAt=0}
+local servicePhase=nil
+local trainingBelt=nil
+local nextTrainAt=0
+
+local function ownedBase(part)
+    local node=part
+    while node and node~=workspace do
+        if node:IsA("Model") and node:GetAttribute("OwnerUserId")==player.UserId then return node end
+        node=node.Parent
+    end
+end
+
+local function canService()
+    local character,root,humanoid=characterParts()
+    return state.alive and state.auto and not state.busy and root~=nil and not carrying()
+        and not isRagdolled() and player:GetAttribute("Chased")~=true
+        and not humanoid.Sit,character,root,humanoid
+end
+
+local function findOwnBelt()
+    local slot=tonumber(player:GetAttribute("PlotSlot"))
+    for _,part in ipairs(CollectionService:GetTagged("Treadmill")) do
+        local base=part:IsA("BasePart") and part:IsDescendantOf(workspace) and ownedBase(part)
+        if base and TrainingPolicy.ownTarget(part:GetAttribute("BaseIndex"),slot,base:GetAttribute("OwnerUserId"),player.UserId) then
+            return part,base
+        end
+    end
+end
+
+stopIdleTraining=function()
+    local belt=trainingBelt
+    trainingBelt=nil
+    if not belt or not belt.Parent then return end
+    local _,root,humanoid=characterParts()
+    local base=ownedBase(belt)
+    local localPoint=root and belt.CFrame:PointToObjectSpace(root.Position)
+    local atBelt=localPoint and TrainingPolicy.insideBelt(localPoint.X,localPoint.Y,localPoint.Z,belt.Size.X,belt.Size.Y,belt.Size.Z)
+    if not TrainingPolicy.canLeave({alive=root~=nil,ownTargetValid=base~=nil,atTrainingPosition=atBelt==true,
+        busy=state.busy,holdingEgg=carrying(),chased=player:GetAttribute("Chased")==true,
+        ragdolled=isRagdolled(),sitting=humanoid and humanoid.Sit,moving=humanoid and humanoid.MoveDirection.Magnitude>0.1}) then return end
+    local floor=base and base:FindFirstChild("Floor")
+    if not floor or not floor:IsA("BasePart") then return end
+    local offsets=TrainingPolicy.offBeltOffsets(belt.Size.X,belt.Size.Z)
+    for _,offset in ipairs(offsets or {}) do
+        local point=belt.CFrame:PointToWorldSpace(Vector3.new(offset.x,0,offset.z))
+        local onFloor=floor.CFrame:PointToObjectSpace(point)
+        if TrainingPolicy.withinOwnFloor(onFloor.X,onFloor.Z,floor.Size.X,floor.Size.Z,2) then
+            local surface=floor.CFrame:PointToWorldSpace(Vector3.new(onFloor.X,floor.Size.Y*0.5,onFloor.Z))
+            local height=math.max(3,humanoid.HipHeight+root.Size.Y*0.5)
+            moveRoot(root,CFrame.new(surface+Vector3.new(0,height+0.1,0))*(root.CFrame-root.Position))
+            return
+        end
+    end
+end
+
+local function trainWhenIdle(eggReady)
+    local allowed,_,root,humanoid=canService()
+    local ready=TrainingPolicy.ready({enabled=state.auto,trainEnabled=taskSelected("train"),busy=state.busy or state.automationBusy,
+        alive=root~=nil,holdingEgg=carrying(),chased=player:GetAttribute("Chased")==true,ragdolled=isRagdolled(),
+        sitting=humanoid and humanoid.Sit,finishPaused=state.pointPaused,collectEnabled=taskSelected("collect"),
+        eligibleEgg=eggReady,pendingEggHint=false,onTreadmill=player:GetAttribute("OnTreadmill")==true})
+    if allowed and not state.pointPaused and player:GetAttribute("OnTreadmill")==true and taskSelected("train") and not eggReady then
+        status("Training speed…");return
+    end
+    if not allowed or not ready or os.clock()<nextTrainAt then return end
+    nextTrainAt=os.clock()+5
+    local belt=findOwnBelt()
+    if not belt then status("Waiting for your treadmill…");return end
+    local offset=TrainingPolicy.standingOffset(belt.Size.Y,humanoid.HipHeight,root.Size.Y)
+    if not offset then return end
+    local position=belt.CFrame:PointToWorldSpace(Vector3.new(0,offset,0))
+    local moved=moveRoot(root,CFrame.new(position)*(root.CFrame-root.Position))
+    if moved then trainingBelt=belt;status("Going to treadmill…") end
+end
+
+local function cancelOurTool(id)
+    local modules=serviceMemory.modules
+    local api=modules and modules.placement
+    if not api or type(id)~="string" then return end
+    local ok,held=pcall(api.GetItemId,api)
+    if ok and held==id then pcall(api.Cancel,api) end
+end
+
+automationCleanup=function()
+    if servicePhase then cancelOurTool(servicePhase.itemId) end
+    servicePhase=nil
+    serviceMemory.ownedPlacementId=nil
+    state.automationBusy=false
+    stopIdleTraining()
+end
+
+local function placeRemote(action)
+    local folder=ReplicatedStorage:FindFirstChild("Remotes")
+    local remote=folder and folder:FindFirstChild(action.remote)
+    if not remote or not remote:IsA("RemoteEvent") then return false end
+    local ok,err=pcall(function()remote:FireServer(action.payload)end)
+    if not ok then warn("[Egg Helper] "..tostring(err)) end
+    return ok
+end
+
+local function readInventory(flags)
+    local snapshot,context,meta=InventoryRuntime.read(player,serviceMemory,RARITY_RANK,flags)
+    if context and context.manualPlacementActive then
+        local held=context.heldItemId
+        if servicePhase and servicePhase.itemId==held then
+            context.manualPlacementActive,context.heldItemId=false,nil
+        elseif held and (serviceMemory.autoHatchUntil[held] or 0)>os.clock() then
+            cancelOurTool(held)
+            serviceMemory.autoHatchUntil[held]=nil
+            context.manualPlacementActive,context.heldItemId=false,nil
+        end
+    end
+    return snapshot,context,meta
+end
+
+local function equipPlaceTool(id,humanoid)
+    local backpack=player:FindFirstChildOfClass("Backpack")
+    local character=player.Character
+    for _,container in ipairs({character,backpack}) do
+        if container then for _,tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") and tool:GetAttribute("ItemId")==id then
+                if container~=character then humanoid:EquipTool(tool) end
+                return true
+            end
+        end end
+    end
+    return false
+end
+
+local function maintenancePosition(meta,root,humanoid)
+    local point=meta.maintenancePosition
+    local floor=meta.floor
+    if not point or not floor then return nil end
+    local localPoint=floor.CFrame:PointToObjectSpace(point)
+    if not TrainingPolicy.withinOwnFloor(localPoint.X,localPoint.Z,floor.Size.X,floor.Size.Z,2) then
+        point=floor.CFrame:PointToWorldSpace(Vector3.new(0,floor.Size.Y*0.5,0))
+            +Vector3.new(0,math.max(3,humanoid.HipHeight+root.Size.Y*0.5)+0.1,0)
+    end
+    return point
+end
+
+automationStep=function(eggReady)
+    local allowed,_,root,humanoid=canService()
+    if not allowed then return state.automationBusy==true end
+    local now=os.clock()
+    if now<(serviceMemory.nextReadAt or 0) then return state.automationBusy==true end
+    serviceMemory.nextReadAt=now+0.25
+    local flags={hatch=taskSelected("hatch"),place=taskSelected("place"),equip=taskSelected("equip")}
+    local snapshot,context,meta=readInventory(flags)
+    if not snapshot or not context then
+        if not eggReady then trainWhenIdle(eggReady) end
+        return false
+    end
+    if context.manualPlacementActive then status("Finish manual placement first.");return true end
+
+    if servicePhase then
+        local phase=servicePhase
+        if not flags.place then automationCleanup();return false end
+        if phase.kind=="await" then
+            local placed=false
+            for _,item in pairs(snapshot.items) do
+                if item.id==phase.itemId and item.placed=="floor" then placed=true;break end
+            end
+            if placed or now>phase.deadline then
+                if not placed then cancelOurTool(phase.itemId);status("Place request not confirmed.") end
+                serviceMemory.pendingUntilById[phase.itemId]=now+(placed and 2 or 10)
+                servicePhase=nil;serviceMemory.ownedPlacementId=nil;state.automationBusy=false;serviceMemory.nextAt=now+0.7
+                return false
+            end
+            return true
+        end
+        if now<phase.at then return true end
+        local action=InventoryPolicy.place(snapshot,context)
+        if not action then
+            cancelOurTool(phase.itemId)
+            servicePhase=nil;serviceMemory.ownedPlacementId=nil;state.automationBusy=false;serviceMemory.nextAt=now+2
+            return false
+        end
+        if phase.kind=="visit" then
+            phase.itemId=action.itemId
+            serviceMemory.ownedPlacementId=action.itemId
+            equipPlaceTool(action.itemId,humanoid)
+            phase.kind,phase.at="place",now+0.2
+            return true
+        end
+        if placeRemote(action) then
+            serviceMemory.pendingUntilById[action.itemId]=now+5
+            servicePhase={kind="await",itemId=action.itemId,deadline=now+3}
+            status("Placing egg…")
+        else
+            automationCleanup();serviceMemory.nextAt=now+3;status("Place unavailable.")
+        end
+        return state.automationBusy==true
+    end
+
+    if now>=serviceMemory.nextAt then
+        local action,reason,pending=InventoryPolicy.plan(snapshot,flags,context)
+        if action and action.kind=="place" then
+            state.automationBusy=true
+            servicePhase={kind="visit",itemId=action.itemId,at=now}
+            serviceMemory.ownedPlacementId=action.itemId
+            return true
+        elseif action then
+            if placeRemote(action) then
+                if action.kind=="hatch" then
+                    serviceMemory.pendingUntilById[action.itemId]=now+5
+                    serviceMemory.autoHatchUntil[action.itemId]=now+30
+                    serviceMemory.nextAt=now+3.2
+                    status("Hatching ready egg…")
+                else
+                    serviceMemory.lastEquipAt,serviceMemory.lastEquipSignature=now,action.signature
+                    serviceMemory.nextAt=now+0.7
+                    status("Equipping best…")
+                end
+            else serviceMemory.nextAt=now+3;status("Auto task unavailable.") end
+        elseif pending and meta and meta.needsMaintenanceTrip and not state.pointPaused then
+            local position=maintenancePosition(meta,root,humanoid)
+            if position then
+                trainingBelt=nil
+                local moved=moveRoot(root,CFrame.new(position)*(root.CFrame-root.Position))
+                if moved then
+                    state.automationBusy=true
+                    servicePhase={kind="visit",itemId=pending.id,at=now+0.75}
+                    serviceMemory.ownedPlacementId=pending.id
+                    status("Visiting your plot…")
+                    return true
+                end
+            end
+        end
+    end
+    if not eggReady then trainWhenIdle(eggReady) end
+    return false
+end
+
+local function automationPreview()
+    local flags={hatch=taskSelected("hatch"),place=taskSelected("place"),equip=taskSelected("equip")}
+    local snapshot,context,meta=InventoryRuntime.read(player,serviceMemory,RARITY_RANK,flags)
+    local action,reason
+    if snapshot and context then action,reason=InventoryPolicy.plan(snapshot,flags,context) end
+    local belt=findOwnBelt()
+    return {snapshotReady=snapshot~=nil,planned=action and action.kind,reason=reason or (meta and meta.reason),
+        readyEggAnchors=meta and meta.readyAnchorCount,needsPlotVisit=meta and meta.needsMaintenanceTrip,
+        ownTreadmill=belt and belt:GetFullName(),requestsSent=0}
+end
+
+
+lifetime.OnInvoke=function(command)
+    if command=="status" then return {auto=state.auto,busy=state.busy,automationBusy=state.automationBusy==true,
+        tasks=table.clone(state.autoTasks),destination=state.destination,movement=state.stopTravel,
+        speedMode=state.speedMode,customSpeed=state.customSpeed,drop=state.dropAtPoint,protected=state.protectHeldEgg} end
+    if command=="preview" then return automationPreview() end
+    cleanup()
+end
+
+local window = app:CreateWindow({
+    Id="eggs", Title="Egg Helper · v1.8.0", Design="MintGlass",
+    Size={640,700}, OpenKey="RightShift", Wallpaper=false, OnClose=cleanup,
+})
+local main=window:AddTab({Title="Main"}):AddSection({Title="Eggs"})
+local settings=window:AddTab({Title="Settings"}):AddSection({Title="Return settings"})
+
+local function updateReturnChoice()
+    state.returnMode=UiPolicy.returnMode(state.destination,state.stopTravel)
+    state.pointPaused=false
+    refreshReturnControls()
+end
+
+main:AddMultiSelect({Id="rarities",Title="Rarities",Default=table.clone(RARITIES),Options=RARITY_OPTIONS,
+    Callback=function(values)state.rarities=table.clone(values);refreshCount()end})
+stopTravelControl=main:AddDropdown({Id="movement",Title="Movement",Default="tween",Options={
+    {value="tween",label="Tween"},
+    {value="timed",label="Tween → teleport"},
+    {value="near",label="Tween close → teleport"},
+    {value="instant",label="Teleport"},
+},Callback=function(value)
+    state.stopTravel=value
+    updateReturnChoice()
+    status(state.protectHeldEgg and value~="tween" and "Safe return ON: held eggs use tween." or "Ready.")
 end})
-recovery:AddParagraph({Text = "Default retry delay is 0s: no increasing backoff or 60-second timer. Auto checks every 0.05s and starts the next attempt once the old action ends, the character is alive/not ragdolled and no egg is held. An optional fixed delay can be selected above. Recovery preserves your settings. Runtime errors or disabling recovery still stop Auto. Returns go straight to the finish point; filtering does not cancel boss hits or grant invulnerability."})
+destinationControl=main:AddDropdown({Id="destination",Title="Finish",Default="bank",Options={
+    {value="bank",label="Bank eggs"},
+    {value="stop",label="Saved drop point"},
+    {value="manual",label="Pickup only"},
+},Callback=function(value)state.destination=value;updateReturnChoice();status("Ready.")end})
+speedSlider=main:AddSlider({Id="speed",Title="Tween speed",Min=0,Max=1000,Step=10,Default=0,
+    Format=function(value)return value==0 and "Auto" or tostring(value)end,
+    Callback=function(value)state.speedMode,state.customSpeed=UiPolicy.speed(value)end})
+dropAtPointToggle=main:AddToggle({Id="dropAtPoint",Title="Drop at saved point",Default=false,Disabled=true,
+    Callback=function(value)state.dropAtPoint=value end})
+main:AddMultiSelect({Id="autoTasks",Title="Auto tasks",Default=table.clone(state.autoTasks),Options={
+    {value="collect",label="Collect eggs"},
+    {value="train",label="Train when idle"},
+    {value="hatch",label="Hatch ready eggs"},
+    {value="place",label="Place owned eggs"},
+    {value="equip",label="Equip best"},
+},Callback=function(values)
+    state.autoTasks=table.clone(values)
+    if not taskSelected("train") and stopIdleTraining then stopIdleTraining() end
+end})
+autoToggle=main:AddToggle({Id="auto",Title="Auto run",Default=false,Callback=function(value)
+    state.auto=value
+    state.epoch+=1
+    if value then
+        state.fault,state.resumeAt,state.failures,state.recoveredAction,state.pointPaused=nil,0,0,-1,false
+    else
+        state.resumeAt=0
+        if automationCleanup then automationCleanup() end
+        cancelTween();endHold()
+        if stopIdleTraining then stopIdleTraining() end
+    end
+    status(value and "Auto ON." or "Stopped.")
+end})
+main:AddButton({Title="Get egg",Variant="primary",Callback=function()
+    if isRagdolled() then status("Recovering from hit…");return end
+    state.pointPaused=false
+    if carrying() then tweenHeldEgg() else runAction(true) end
+end})
+main:AddButton({Title="Stop",Callback=function()
+    autoToggle:SetValue(false)
+    state.epoch+=1
+    cancelTween();endHold()
+    if stopIdleTraining then stopIdleTraining() end
+    status("Stopped.")
+end})
+countLabel=main:AddText({Text="Eggs: 0"})
+statusLabel=main:AddText({Text="Status: Ready."})
+
+settings:AddToggle({Id="protectHeldEgg",Title="Safe return (no held-egg TP)",Default=true,
+    Callback=function(value)state.protectHeldEgg=value end})
+returnDelaySlider=settings:AddSlider({Id="snapAfter",Title="Tween → TP delay (seconds)",Min=0.25,Max=10,Step=0.25,Default=1,
+    Callback=function(value)state.snapAfter=value end})
+returnDistanceSlider=settings:AddSlider({Id="snapDistance",Title="Near → TP distance (studs)",Min=1,Max=200,Step=1,Default=12,
+    Callback=function(value)state.snapDistance=value end})
+refreshReturnControls()
+
 
 local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
 local effects = remotes and remotes:WaitForChild("PlayEffect", 10)
@@ -980,21 +1476,44 @@ end)
 
 refreshCount()
 task.spawn(function()
-    local nextCountRefresh = 0
+    local nextCountRefresh=0
     while state.alive do
         if not state.busy then
-            state.carryLock = carrying()
-            if os.clock() >= nextCountRefresh then
-                refreshCount()
-                nextCountRefresh = os.clock()+1
-            end
+            state.carryLock=carrying()
+            if os.clock()>=nextCountRefresh then refreshCount();nextCountRefresh=os.clock()+1 end
             if state.auto then
-                if state.pointPaused then status("Auto ON; stopped at point. Change return mode or Resume auto to continue.")
-                elseif state.resumeAt > os.clock() then failureStatus()
-                elseif player:GetAttribute("Ragdolled") == true then status("Auto ON; waiting for ragdoll recovery.")
-                elseif carrying() then status("Auto ON; waiting for held egg to clear. Use Return current egg if needed.")
-                elseif state.streamOn and not state.streamReady then status("Auto ON; initial zone streaming scan in progress.")
-                else runAction(true) end
+                if state.resumeAt>os.clock() then failureStatus()
+                elseif isRagdolled() then status("Recovering from hit…")
+                elseif carrying() then
+                    if state.automationBusy and automationCleanup then automationCleanup() end
+                    status("Holding an egg. Press Get egg to return.")
+                else
+                    local eggReady=false
+                    if taskSelected("collect") and not state.pointPaused then
+                        local egg=findEgg()
+                        eggReady=egg~=nil
+                        if not eggReady then for _,hint in pairs(state.eggCache) do
+                            if table.find(state.rarities,hint.rarity) and os.clock()-hint.seen<=state.cacheTTL and zoneAllowed(hint.zone) then eggReady=true;break end
+                        end end
+                    end
+                    local ownedBusy=false
+                    if automationStep and os.clock()>=(state.automationRetryAt or 0) then
+                        local ok,result=pcall(automationStep,eggReady)
+                        ownedBusy=ok and result==true
+                        if not ok then
+                            warn("[Egg Helper] Auto task: "..tostring(result))
+                            state.automationRetryAt=os.clock()+5
+                            if automationCleanup then pcall(automationCleanup) end
+                        end
+                    end
+                    if not ownedBusy then
+                        if state.pointPaused then status("At finish. Press Get egg or restart Auto.")
+                        elseif taskSelected("collect") and eggReady then runAction(true)
+                        elseif #state.autoTasks==0 then status("Choose an auto task.")
+                        elseif taskSelected("collect") and not taskSelected("train") then status("Waiting for selected eggs…")
+                        elseif not taskSelected("train") then status("Auto ON.") end
+                    end
+                end
             end
         end
         task.wait(state.auto and 0.05 or 0.5)
@@ -1007,7 +1526,7 @@ task.spawn(function()
         pcall(function() enabled = workspace.StreamingEnabled end)
         if enabled == false then
             state.streamReady,state.scanRequested = true,false
-        elseif state.streamOn and (state.auto or state.scanRequested) and state.resumeAt <= os.clock()
+        elseif state.streamOn and ((state.auto and taskSelected("collect")) or state.scanRequested) and state.resumeAt <= os.clock()
             and not state.busy and not carrying() and not state.streamBusy and os.clock() >= state.nextStreamAt then
             local ok, reason = pcall(streamStep)
             if not ok then
