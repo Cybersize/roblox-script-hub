@@ -1,10 +1,10 @@
--- Egg collector / instant retry / Celestial + zone 9 / preserved settings (1.6.1).
+-- Egg collector / hybrid controls / faster custom tween / v629 config (1.7.0).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
 -- No purchase/admin remotes are used. Pickup must be accepted by the server.
 -- Normal teleport buttons require empty hands. Explicit experimental return
--- modes may teleport a held egg and can cause a server reset; they are not bypasses.
+-- modes can teleport a held egg only with protection OFF and may reset it.
 -- Direct stop-point tween with drop OFF is the default. No speed stats/physics flags are changed.
 
 local PLACE_ID = 129852792970565
@@ -83,8 +83,9 @@ local state = {
     alive = true, busy = false, auto = false, epoch = 0, carryLock = false,
     rarities = table.clone(RARITIES), priority = "Highest rarity first", returnMode = "stop", saved = nil,
     stopTravel = "tween", dropAtPoint = false,
+    protectHeldEgg = true,
     snapAfter = 1, snapDistance = 12,
-    speedMode = "Match carry speed", customSpeed = 100,
+    speedMode = "Match carry speed", customSpeed = 250,
     banks = 0, slips = 0, fault = nil,
     autoRecover = true, retryDelay = 0, resumeAt = 0,
     failures = 0, actionSerial = 0, recoveredAction = -1,
@@ -160,7 +161,7 @@ end
 function ReturnPolicy.speed(requested, walkSpeed, capped)
     if type(walkSpeed) ~= "number" or walkSpeed <= 0 then return nil end
     if capped then return walkSpeed * 0.9 end
-    return math.clamp(tonumber(requested) or 100, 10, 250)
+    return math.clamp(tonumber(requested) or 250, 10, 1000)
 end
 function ReturnPolicy.result(expected, currentId, banks, bankBaseline, slips, slipBaseline, rejects, rejectBaseline)
     if slips > slipBaseline or rejects > rejectBaseline then return "rejected" end
@@ -168,14 +169,16 @@ function ReturnPolicy.result(expected, currentId, banks, bankBaseline, slips, sl
     if currentId == expected then return "carrying" end
     return "unconfirmed"
 end
-function ReturnPolicy.shouldSnap(mode, elapsed, remaining, bankConfirmed, delay, distance)
+function ReturnPolicy.shouldSnap(mode, elapsed, remaining, bankConfirmed, delay, distance, protectHeldEgg, currentId)
+    if protectHeldEgg and type(currentId) == "string" and currentId ~= "" then return false end
     if mode == "banked" then return bankConfirmed end
     if mode == "timed" then return elapsed >= delay end
     if mode == "near" then return remaining <= distance end
     return mode == "instant"
 end
-function ReturnPolicy.allowSnap(mode, expectedId, currentId, bankConfirmed)
+function ReturnPolicy.allowSnap(mode, expectedId, currentId, bankConfirmed, protectHeldEgg)
     local hasEgg = type(currentId) == "string" and currentId ~= ""
+    if protectHeldEgg and hasEgg then return false end
     if hasEgg and currentId ~= expectedId then return false end
     if mode == "banked" then return bankConfirmed and not hasEgg end
     local experimental = mode == "timed" or mode == "near" or mode == "instant"
@@ -380,10 +383,10 @@ local zoneDefinitions = zoneConfig and zoneConfig.Zones or {
     {Index=2,LengthStuds=130,NestOffsetStuds=90,RequiredSpeed=900,GuardSpeed=28.5},
     {Index=3,LengthStuds=300,NestOffsetStuds=210,RequiredSpeed=10000,GuardSpeed=54},
     {Index=4,LengthStuds=520,NestOffsetStuds=365,RequiredSpeed=170000,GuardSpeed=78},
-    {Index=5,LengthStuds=730,NestOffsetStuds=510,RequiredSpeed=2500000,GuardSpeed=110.5},
-    {Index=6,LengthStuds=870,NestOffsetStuds=610,RequiredSpeed=18000000,GuardSpeed=136},
-    {Index=7,LengthStuds=676,NestOffsetStuds=470,RequiredSpeed=150000000,GuardSpeed=163},
-    {Index=8,LengthStuds=900,NestOffsetStuds=630,RequiredSpeed=1000000000,GuardSpeed=180},
+    {Index=5,LengthStuds=730,NestOffsetStuds=510,RequiredSpeed=1300000,GuardSpeed=110.5},
+    {Index=6,LengthStuds=870,NestOffsetStuds=610,RequiredSpeed=10000000,GuardSpeed=136},
+    {Index=7,LengthStuds=676,NestOffsetStuds=470,RequiredSpeed=80000000,GuardSpeed=163},
+    {Index=8,LengthStuds=900,NestOffsetStuds=630,RequiredSpeed=650000000,GuardSpeed=180},
     {Index=9,LengthStuds=900,NestOffsetStuds=630,RequiredSpeed=5000000000,GuardSpeed=200},
 }
 local zoneByIndex = {}
@@ -519,9 +522,9 @@ resolveEgg = function(current)
     return findEgg()
 end
 
-local function teleportReturn(id, root, current, mode, bankConfirmed, destination)
+local function teleportReturn(id, root, current, mode, bankConfirmed, destination, protectHeldEgg)
     if not current() then return false, "Return cancelled." end
-    if not ReturnPolicy.allowSnap(mode, id, player:GetAttribute("CarryingEgg"), bankConfirmed) then
+    if not ReturnPolicy.allowSnap(mode, id, player:GetAttribute("CarryingEgg"), bankConfirmed, protectHeldEgg) then
         return false, "Teleport not authorized by this return mode/carry state."
     end
     cancelTween()
@@ -537,7 +540,8 @@ local function tweenToBank(id, root, humanoid, current)
     if mode == "manual" then return false, "Manual return selected; choose another mode to use this button." end
     local stopping = stopPointMode(mode)
     local movement = stopping and (state.stopTravel or "tween") or mode
-    -- Capture both controls for this action; changes apply to the next return.
+    local protectHeldEgg = state.protectHeldEgg ~= false
+    -- Capture movement, protection and drop choices for this action.
     local dropRequested = mode == "stop_drop" or mode ~= "stop_hold" and state.dropAtPoint == true
     local goal = stopping and stopDestination() or bankDestination()
     -- Every mode heads straight to its chosen finish point. No edge waypoints.
@@ -584,8 +588,9 @@ local function tweenToBank(id, root, humanoid, current)
                 return false, "Carry state changed without a complete bank confirmation.", "unconfirmed"
             end
             task.wait(0.05)
-        elseif ReturnPolicy.shouldSnap(movement, os.clock() - started, remaining, bankConfirmed, snapAfter, snapDistance) then
-            local ok, message = teleportReturn(id, root, current, movement, bankConfirmed, goal)
+        elseif ReturnPolicy.shouldSnap(movement, os.clock() - started, remaining, bankConfirmed, snapAfter, snapDistance,
+            protectHeldEgg,currentId) then
+            local ok, message = teleportReturn(id, root, current, movement, bankConfirmed, goal,protectHeldEgg)
             if not ok then return false, message end
             snapped, snappedAt = true, os.clock()
             status(stopping and "Teleported once to stop point; verifying position and held egg before hold/drop."
@@ -617,7 +622,8 @@ local function tweenToBank(id, root, humanoid, current)
             local tween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear),
                 {CFrame = CFrame.lookAt(nextPoint, nextPoint + direction)})
             activeTween = tween
-            status(string.format("Return mode %s: tween %.1f studs/s", mode, speed))
+            status(string.format(protectHeldEgg and carrying() and "Protected return %s: tween %.1f studs/s; held-egg TP blocked."
+                or "Return mode %s: tween %.1f studs/s", mode, speed))
             tween:Play()
             local expires, switchToSnap = os.clock() + duration + 1, false
             while current() and os.clock() < expires and tween.PlaybackState ~= Enum.PlaybackState.Completed do
@@ -626,7 +632,7 @@ local function tweenToBank(id, root, humanoid, current)
                     or state.slips > slipBaseline
                     or (tonumber(player:GetAttribute("RejectCount")) or 0) > rejectBaseline then break end
                 if ReturnPolicy.shouldSnap(movement, os.clock() - started, (goal - root.Position).Magnitude,
-                    bankCleared, snapAfter, snapDistance) then
+                    bankCleared, snapAfter, snapDistance,protectHeldEgg,player:GetAttribute("CarryingEgg")) then
                     switchToSnap = true
                     break
                 end
@@ -774,7 +780,7 @@ local function tweenHeldEgg()
 end
 
 local window = app:CreateWindow({
-    Id = "eggs", Title = "Egg Collector · Instant Retry · v1.6.1", Design = "MintGlass",
+    Id = "eggs", Title = "Egg Collector · Hybrid / Fast Tween · v1.7.0", Design = "MintGlass",
     Size = { 720, 650 }, OpenKey = "RightShift", Wallpaper = false,
     OnClose = cleanup,
 })
@@ -848,7 +854,7 @@ autoToggle = section:AddToggle({
         status(value and ("Auto enabled; priority: " .. state.priority .. ".") or "Auto stopped; active return cancelled.")
     end,
 })
-section:AddParagraph({Text = "First choose stop-point movement, then Drop ON/OFF. Saved stop point is (-184.134, 4.238, 397.775); Drop OFF keeps the egg, ON requests one native drop there. No left/right detour. Bank modes are separate and ignore the drop toggle. Auto waits after reaching the stop point. RightShift toggles this menu."})
+section:AddParagraph({Text = "Choose movement and Drop ON/OFF. Protection ON (Return options) blocks held-egg teleports: returns finish by direct tween instead, even if a teleport/hybrid mode is selected. Saved stop point is (-184.134, 4.238, 397.775); Drop OFF keeps the egg, ON requests one native drop there. Bank modes ignore Drop. Auto waits at the stop point. RightShift toggles the menu."})
 section:AddButton({Title = "Unload", Callback = cleanup})
 
 local returnSettings = window:AddTab({Title = "Return options"}):AddSection({Title = "Hybrid timing & distance"})
@@ -859,7 +865,13 @@ returnDistanceSlider = returnSettings:AddSlider({Id = "snapDistance", Title = "N
     Min = 1, Max = 200, Step = 1, Default = 12, Disabled = true,
     Callback = function(value) state.snapDistance = value end})
 refreshReturnControls()
-returnSettings:AddParagraph({Text = "Timed mode tweens for the chosen delay, then teleports once. Near-target mode tweens until close enough, then teleports once. Both can teleport a held egg and trigger resets. Bank-confirmed mode never teleports until your own bank event and cleared carry state are observed. Mode/timing changes apply to the next return."})
+returnSettings:AddToggle({Id="protectHeldEgg", Title="Protect held egg: tween instead of teleport", Default=true,
+    Callback=function(value)
+        state.protectHeldEgg = value
+        status(value and "Protection ON for next return: no teleport while holding an egg; complete by tween."
+            or "Protection OFF for next return: experimental held-egg teleports may reset the egg.")
+    end})
+returnSettings:AddParagraph({Text = "Protection is ON by default. Timed/near/instant return modes keep tweening while the egg is held instead of making the rejected jump. A teleport is allowed only with empty hands and the required bank confirmation. At the stop point, Drop OFF keeps holding; Drop ON requests the normal drop. Protection does not bypass server checks or guarantee fast-tween acceptance. Turn it OFF only to restore experimental carried-egg jumps. Changes apply to the next return."})
 returnSettings:AddButton({Title = "Return current egg to selected destination", Callback = tweenHeldEgg})
 returnSettings:AddParagraph({Text = "Stop point: X=-184.1337127685547, Y=4.237677097320557, Z=397.77520751953125. Movement and Drop are separate controls on Eggs. Tween travels directly without a guard-edge detour. Teleport/hybrids can reset a held egg. Drop ON waits up to 8s for Chased to clear, sends one normal RequestDropEgg, and checks for the dropped egg nearby; OFF keeps holding. Stop-point completion is not a bank. Controls are captured at action start; Stop + Return current egg applies changes to a held egg. Auto waits here until you change mode, Resume auto or toggle Auto off/on."})
 returnSettings:AddButton({Title = "Stop current action", Callback = function()
@@ -877,9 +889,9 @@ speedModeControl = settings:AddDropdown({Id = "speedMode", Title = "Tween speed 
         if speedSlider then speedSlider:Update({Disabled = value == "Match carry speed"}) end
     end})
 speedSlider = settings:AddSlider({Id = "customSpeed", Title = "Custom tween speed (studs/sec)",
-    Min = 10, Max = 250, Step = 5, Default = 100, Disabled = true,
+    Min = 10, Max = 1000, Step = 5, Default = 250, Disabled = true,
     Callback = function(value) state.customSpeed = value end})
-settings:AddParagraph({Text = "Match carry speed uses 90% of the current Humanoid.WalkSpeed. Custom mode can be faster, but the server may still reset the egg. No carry speed, collision, anchoring or network settings are changed. Recovery keeps Auto ON with a cooldown after a reset or unconfirmed bank."})
+settings:AddParagraph({Text = "Match carry speed uses 90% of current Humanoid.WalkSpeed. To tween faster, select Custom speed and choose 10–1000 studs/sec (default 250). High speeds can reset the egg or be corrected by the server; this does not raise server-authorized movement speed. No stats, collision, anchoring or network settings are changed. Retry delay defaults to 0s and recovery preserves your selected settings."})
 settings:AddButton({ Title = "Return previous position (empty hands only)", Callback = function()
     if state.busy then return end
     local _, root = characterParts()
