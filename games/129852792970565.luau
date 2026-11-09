@@ -1,12 +1,13 @@
--- Egg helper / simple Main + Settings / optional owned-item tasks (1.8.0).
+-- Egg helper / Main / Egg / Shop / Settings / optional owned-item tasks (1.9.0).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
--- No purchase/admin remotes are used. Pickup must be accepted by the server.
+-- Cash purchases require explicit Shop toggles; no premium/admin requests.
+-- Pickup and cash requests must be accepted by the server.
 -- Normal teleport buttons require empty hands. Explicit experimental return
 -- modes can teleport a held egg only with protection OFF and may reset it.
 -- Direct bank tween is the default; the saved drop point remains available.
--- No purchases, paid skips, selling, speed stats or physics flags are changed.
+-- No Robux purchases, paid skips, selling, resets, speed stats or physics flags.
 
 local PLACE_ID = 129852792970565
 if game.PlaceId ~= PLACE_ID then
@@ -84,6 +85,7 @@ local state = {
     alive = true, busy = false, auto = false, epoch = 0, carryLock = false,
     automationBusy=false, automationRetryAt=0,
     rarities = table.clone(RARITIES), priority = "Highest rarity first", returnMode = "tween", saved = nil,
+    placeChoice="best", autoUpgrade=false,autoBuy=false,purchaseTargets={"cafe","treadmill","bag","eggs","trails"},
     destination = "bank", autoTasks = {"collect","train","hatch","place","equip"},
     stopTravel = "tween", dropAtPoint = false,
     protectHeldEgg = true,
@@ -93,14 +95,15 @@ local state = {
     autoRecover = true, retryDelay = 0, resumeAt = 0,
     failures = 0, actionSerial = 0, recoveredAction = -1,
     streamOn = true, streamScope = "All zones", streamTimeout = 2,
+    streamError=false,bankSensor=false,
     streamBusy = false, streamCursor = 1, streamVisited = {}, streamReady = false,
     nextStreamAt = 0, scanRequested = false, eggCache = {}, cacheTTL = 90,
     skipFastGuards = false, pointPaused = false,
 }
-local app, statusLabel, countLabel, activePrompt, activeTween, autoToggle, speedSlider, returnDelaySlider, returnDistanceSlider
-local destinationControl, streamLabel, stopTravelControl, dropAtPointToggle
+local app, statusLabel, eggStatusLabel, countLabel, activePrompt, activeTween, autoToggle, speedSlider, returnDelaySlider, returnDistanceSlider
+local destinationControl, streamLabel, stopTravelControl, dropAtPointToggle, placeEggControl, purchaseStatusLabel
 local cacheLoadedEggs, resolveEgg, zoneAllowed, streamStep
-local automationStep, automationCleanup, stopIdleTraining
+local automationStep, automationCleanup, stopIdleTraining, refreshOwnedEggChoices, purchaseStep
 local connections = {}
 local lifetime = Instance.new("BindableFunction")
 lifetime.Name = LIFETIME_NAME
@@ -141,6 +144,7 @@ local function status(message)
     if state.alive and statusLabel and message ~= lastStatusMessage then
         lastStatusMessage = message
         statusLabel:Update({ Text = "Status: " .. message })
+        if eggStatusLabel then eggStatusLabel:Update({Text="Status: "..message}) end
     end
 end
 
@@ -859,13 +863,59 @@ function InventoryPolicy.hatch(snapshot,context)
     if not egg then return nil,"No ready placed egg" end
     return {kind="hatch",remote="RequestHatchEgg",itemId=egg.id,payload={itemId=egg.id}}
 end
+function InventoryPolicy.matchesPlace(item,choice)
+    if choice==nil or choice=="best" then return true end
+    if type(choice)~="string" then return false end
+    if choice:sub(1,7)=="rarity:" then return item.rarity==choice:sub(8) end
+    if choice:sub(1,5)=="item:" then return item.id==choice:sub(6) end
+    return false
+end
+function InventoryPolicy.placementOptions(snapshot,ranks,choice)
+    local rows,counts={},{}
+    for _,item in pairs(items(snapshot)) do
+        if type(item)=="table" and item.kind=="Egg" and type(item.id)=="string" and item.id~=""
+            and (item.placed==nil or item.placed=="") then
+            rows[#rows+1]=item
+            local rarity=type(item.rarity)=="string" and item.rarity or "Unknown"
+            counts[rarity]=(counts[rarity] or 0)+1
+        end
+    end
+    local function rank(item)return tonumber(ranks and ranks[item.rarity]) or 0 end
+    table.sort(rows,function(a,b)return rank(a)>rank(b) or rank(a)==rank(b) and a.id<b.id end)
+    local options={{value="best",label="Best available"}}
+    -- Keep configured rarities selectable even before the next matching egg is owned.
+    for rarity in pairs(ranks or {}) do
+        if type(rarity)=="string" and rarity~="" and counts[rarity]==nil then counts[rarity]=0 end
+    end
+    local rarities={}
+    for rarity in pairs(counts) do rarities[#rarities+1]=rarity end
+    table.sort(rarities,function(a,b)
+        local ar,br=tonumber(ranks and ranks[a]) or 0,tonumber(ranks and ranks[b]) or 0
+        return ar>br or ar==br and a<b
+    end)
+    for _,rarity in ipairs(rarities) do
+        options[#options+1]={value="rarity:"..rarity,label=rarity.." eggs ("..counts[rarity]..")"}
+    end
+    for _,item in ipairs(rows) do
+        local mutation=type(item.mutation)=="string" and item.mutation~="" and item.mutation~="Normal" and " / "..item.mutation or ""
+        options[#options+1]={value="item:"..item.id,label=tostring(item.rarity or "Unknown")..mutation.." - "..item.id:sub(-8)}
+    end
+    local found=choice==nil
+    for _,option in ipairs(options) do if option.value==choice then found=true end end
+    if not found and type(choice)=="string" then
+        options[#options+1]={value=choice,label=choice:sub(1,7)=="rarity:" and choice:sub(8).." eggs (none owned)" or "Selected egg unavailable"}
+    end
+    local signature={}
+    for _,option in ipairs(options) do signature[#signature+1]=option.value.."="..option.label end
+    return options,table.concat(signature,"|")
+end
 function InventoryPolicy.place(snapshot,context)
     if context.manualPlacementActive then return nil,"Manual placement active" end
     local cap=context.eggCap
     if not finite(cap) or cap<0 then return nil,"Egg capacity unknown" end
     if InventoryPolicy.placedEggCount(snapshot)>=cap then return nil,"Egg spaces full" end
     local egg=bestEgg(snapshot,context,function(item)
-        return (item.placed==nil or item.placed=="") and item.id~=context.heldItemId
+        return (item.placed==nil or item.placed=="") and item.id~=context.heldItemId and InventoryPolicy.matchesPlace(item,context.placeChoice)
     end)
     if not egg then return nil,"No unplaced owned egg" end
     local spot=context.candidate
@@ -1011,7 +1061,7 @@ function InventoryRuntime.read(player,memory,ranks,flags)
     if not ok or type(snapshot)~="table" or type(snapshot.items)~="table" then
         return nil,nil,{reason="Inventory snapshot not ready"}
     end
-    local context={now=os.clock(),ranks=ranks,eggCap=tonumber(player:GetAttribute("EggCap")),
+    local context={now=os.clock(),ranks=ranks,placeChoice=memory.placeChoice,eggCap=tonumber(player:GetAttribute("EggCap")),
         remainingById={},pendingUntilById=memory.pendingUntilById or {},
         lastEquipAt=memory.lastEquipAt,lastEquipSignature=memory.lastEquipSignature}
     local meta={snapshot=snapshot,readyAnchorCount=0}
@@ -1098,8 +1148,176 @@ return InventoryRuntime
 
 end)()
 
+local PurchasePolicy = (function()
+-- Pure normal-cash purchase planner. No services, movement or remote dispatch.
+-- rows: {category,key?,label?,cost,remote,payload,stamp,currency?="Money"}.
+-- categories: cafe,treadmill,bag,eggs,trails. Use actual next-step native prices.
+-- flags: upgradeEnabled,buyEnabled,targets? (array or category=true map).
+-- Missing targets means all categories; an explicit empty table means none.
+-- context: money,now?,pending?,blockedUntilByStamp? (per PurchasePolicy.key).
+-- Any pending request blocks ALL further purchases until caller confirms/times out.
+-- A returned action is only an unconfirmed request, never proof of a purchase.
+-- PURCHASE_POLICY_BEGIN
+local PurchasePolicy = {}
+local ORDER={cafe=1,treadmill=2,bag=3,eggs=4,trails=5}
+local function finite(value)
+    return type(value)=="number" and value==value and value>-math.huge and value<math.huge
+end
+local function validStamp(value)
+    if type(value)=="string" then return value~="" end
+    return type(value)=="number" and finite(value) and value>=0 and value%1==0
+end
+local function exactKeys(payload,allowed)
+    for key in pairs(payload) do if not allowed[key] then return false end end
+    return true
+end
+local function selected(flags,category)
+    if category=="trails" then
+        if flags.buyEnabled~=true then return false end
+    elseif flags.upgradeEnabled~=true then return false end
+    local targets=flags.targets
+    if targets==nil then return true end
+    if type(targets)~="table" then return false end
+    if targets[category]==true then return true end
+    return table.find(targets,category)~=nil
+end
+
+function PurchasePolicy.actionOf(row)
+    if type(row)~="table" or not ORDER[row.category] or not finite(row.cost) or row.cost<0
+        or not validStamp(row.stamp) or (row.currency~=nil and row.currency~="Money")
+        or row.paidOnly==true or row.robux==true or type(row.payload)~="table" then return nil end
+    local category,payload=row.category,row.payload
+    local normalized
+    if category=="cafe" or category=="treadmill" then
+        local action=category=="cafe" and "UpgradePen" or "BuyTreadmill"
+        if row.remote~="RequestShop" or payload.action~=action or not exactKeys(payload,{action=true}) then return nil end
+        normalized={action=action}
+    elseif category=="bag" or category=="eggs" then
+        local kind=category=="bag" and "Bag" or "Eggs"
+        if row.remote~="RequestUpgrade" or payload.kind~=kind or not exactKeys(payload,{kind=true}) then return nil end
+        normalized={kind=kind}
+    else
+        if row.remote~="RequestShop" or payload.action~="BuyTrail" or type(row.key)~="string"
+            or row.key=="" or payload.key~=row.key or not exactKeys(payload,{action=true,key=true}) then return nil end
+        normalized={action="BuyTrail",key=row.key}
+    end
+    return {category=category,key=category=="trails" and row.key or nil,label=type(row.label)=="string" and row.label or category,
+        cost=row.cost,remote=row.remote,payload=normalized,stamp=row.stamp,currency="Money"}
+end
+
+function PurchasePolicy.key(action)
+    return action.category..":"..tostring(action.key or "")..":"..tostring(action.stamp)
+end
+
+function PurchasePolicy.confirmed(pending,currentStamp)
+    if type(pending)~="table" or not validStamp(pending.stamp) or not validStamp(currentStamp) then return false end
+    if type(pending.stamp)=="number" and type(currentStamp)=="number" then return currentStamp>pending.stamp end
+    return type(pending.stamp)==type(currentStamp) and pending.stamp~=currentStamp
+end
+
+function PurchasePolicy.plan(rows,flags,context)
+    if type(flags)~="table" or type(context)~="table" then return nil,"Purchase state unavailable" end
+    if context.pending~=nil and context.pending~=false then return nil,"Purchase pending" end
+    if not finite(context.money) or context.money<0 then return nil,"Cash balance unavailable" end
+    if type(rows)~="table" then return nil,"Cash upgrades unavailable" end
+    local best,bestKey
+    for _,row in pairs(rows) do
+        local action=PurchasePolicy.actionOf(row)
+        if action and selected(flags,action.category) and action.cost<=context.money then
+            local key=PurchasePolicy.key(action)
+            local blocked=type(context.blockedUntilByStamp)=="table" and context.blockedUntilByStamp[key]
+            local allowed=not finite(blocked) or finite(context.now) and context.now>=blocked
+            if allowed and (not best or action.cost<best.cost
+                or action.cost==best.cost and (ORDER[action.category]<ORDER[best.category]
+                    or ORDER[action.category]==ORDER[best.category] and key<bestKey)) then
+                best,bestKey=action,key
+            end
+        end
+    end
+    return best,best and "Affordable cash request" or "No selected affordable cash upgrade"
+end
+-- PURCHASE_POLICY_END
+return PurchasePolicy
+
+end)()
+
+local PurchaseRuntime = (function()
+-- Read-only adapter for confirmed native cash-upgrade interfaces.
+local PurchaseRuntime={}
+local function finite(n)return type(n)=="number" and n==n and n>=0 and n<math.huge end
+local function level(n)return finite(n) and n%1==0 end
+local function module(parent,name)
+    local target=parent and parent:FindFirstChild(name)
+    if not target or not target:IsA("ModuleScript") then return nil end
+    local ok,result=pcall(require,target)
+    return ok and type(result)=="table" and result or nil
+end
+function PurchaseRuntime.read(player,memory)
+    local rs=game:GetService("ReplicatedStorage")
+    local shared=rs:FindFirstChild("Shared")
+    local config=shared and shared:FindFirstChild("Config")
+    local kit=shared and shared:FindFirstChild("Kit")
+    local scripts=player:FindFirstChild("PlayerScripts")
+    local client=scripts and scripts:FindFirstChild("Client")
+    local controllers=client and client:FindFirstChild("Controllers")
+    local modules=memory.modules
+    if not modules then
+        modules={econ=module(kit,"Econ"),upgrade=module(config,"UpgradeConfig"),speed=module(config,"SpeedConfig"),
+            snapshot=module(controllers,"SnapshotController"),constants=module(shared,"Constants")}
+        if not modules.econ or not modules.upgrade or not modules.speed or not modules.snapshot or not modules.constants then
+            return nil,nil,nil,"Shop data not ready"
+        end
+        memory.modules=modules
+    end
+    local attr=modules.constants.Attr
+    local money=player:GetAttribute(attr.Money or "Money")
+    local rows,stamps={},{}
+    local pen=player:GetAttribute(attr.PenLevel or "PenLevel")
+    local tier=player:GetAttribute(attr.TreadmillTier or "TreadmillTier")
+    stamps.cafe,stamps.treadmill=pen,tier
+    local function add(category,label,cost,remote,payload,stamp,key)
+        if finite(cost) then rows[#rows+1]={category=category,label=label,cost=cost,remote=remote,payload=payload,stamp=stamp,key=key,currency="Money"} end
+    end
+    if level(pen) then
+        local ok,cost=pcall(modules.econ.UpgradeCost,"Cafe",pen)
+        if ok then add("cafe","Cafe / base",cost,"RequestShop",{action="UpgradePen"},pen) end
+    end
+    if level(tier) then
+        local unlocked,yes=pcall(modules.econ.TreadmillUnlocked,pen)
+        if tier>=1 or unlocked and yes==true then
+            local ok,cost=pcall(modules.econ.UpgradeCost,"Treadmill",tier)
+            if ok then add("treadmill","Treadmill",cost,"RequestShop",{action="BuyTreadmill"},tier) end
+        end
+    end
+    for _,info in ipairs({{category="bag",kind="Bag",label="Bag capacity"},{category="eggs",kind="Eggs",label="Egg capacity"}}) do
+        local cfg=modules.upgrade[info.kind]
+        local current=cfg and cfg.Attr and player:GetAttribute(cfg.Attr.Level)
+        stamps[info.category]=current
+        if level(current) then
+            local ok,step=pcall(modules.upgrade.Step,info.kind,current)
+            if ok and type(step)=="table" and step.Level==current+1 then
+                add(info.category,info.label,step.Cost,"RequestUpgrade",{kind=info.kind},current)
+            end
+        end
+    end
+    local ok,snapshot=pcall(modules.snapshot.Get,modules.snapshot)
+    if ok and type(snapshot)=="table" and type(snapshot.trailsOwned)=="table" then
+        for _,trail in ipairs(modules.speed.Trails or {}) do
+            if type(trail.Key)=="string" and trail.Key~="" then
+                local owned=snapshot.trailsOwned[trail.Key]==true
+                stamps["trails:"..trail.Key]=owned and 1 or 0
+                if not owned then add("trails",trail.Name or trail.Key,trail.Cost,"RequestShop",{action="BuyTrail",key=trail.Key},0,trail.Key) end
+            end
+        end
+    end
+    return rows,money,stamps
+end
+return PurchaseRuntime
+
+end)()
+
 -- Owned-item/idle-training adapter. All requests are opt-in through Auto tasks.
-local serviceMemory={pendingUntilById={},autoHatchUntil={},nextAt=0}
+local serviceMemory: {[string]:any}={pendingUntilById={},autoHatchUntil={},nextAt=0}
 local servicePhase=nil
 local trainingBelt=nil
 local nextTrainAt=0
@@ -1201,6 +1419,7 @@ local function placeRemote(action)
 end
 
 local function readInventory(flags)
+    serviceMemory.placeChoice=state.placeChoice
     local snapshot,context,meta=InventoryRuntime.read(player,serviceMemory,RARITY_RANK,flags)
     if context and context.manualPlacementActive then
         local held=context.heldItemId
@@ -1334,13 +1553,69 @@ automationStep=function(eggReady)
     return false
 end
 
+local purchaseMemory: {[string]:any}={blockedUntilByStamp={},nextAt=0}
+local lastPurchaseStatus
+local function purchaseStatus(message)
+    if purchaseStatusLabel and message~=lastPurchaseStatus then
+        lastPurchaseStatus=message;purchaseStatusLabel:Update({Text="Purchases: "..message})
+    end
+end
+local function purchaseToggleStatus()
+    if not state.autoUpgrade and not state.autoBuy then purchaseStatus("OFF")
+    else purchaseStatus(state.auto and "ON" or "Paused - Auto run is OFF") end
+end
+purchaseStep=function()
+    local now=os.clock()
+    if not state.autoUpgrade and not state.autoBuy then purchaseStatus("OFF");return end
+    if now<purchaseMemory.nextAt then return end
+    purchaseMemory.nextAt=now+1
+    local rows,money,stamps,reason=PurchaseRuntime.read(player,purchaseMemory)
+    if not rows then purchaseStatus(reason or "Waiting for shop data");return end
+    local pending=purchaseMemory.pending
+    if pending then
+        local stamp=stamps[pending.category=="trails" and "trails:"..pending.key or pending.category]
+        if PurchasePolicy.confirmed(pending,stamp) then
+            purchaseStatus("Bought "..pending.label)
+            purchaseMemory.pending=nil
+            return
+        elseif now<pending.deadline then purchaseStatus("Waiting for "..pending.label);return
+        else
+            purchaseMemory.blockedUntilByStamp[PurchasePolicy.key(pending)]=now+15
+            purchaseMemory.pending=nil
+            purchaseStatus("Not confirmed; backing off")
+            return
+        end
+    end
+    local action=PurchasePolicy.plan(rows,{upgradeEnabled=state.autoUpgrade,buyEnabled=state.autoBuy,targets=state.purchaseTargets},
+        {money=money,now=now,blockedUntilByStamp=purchaseMemory.blockedUntilByStamp})
+    if not action then purchaseStatus("Waiting for affordable upgrades");return end
+    -- Exact allowlist is checked by the pure policy again at the dispatch boundary.
+    action=PurchasePolicy.actionOf(action)
+    if not action then return end
+    local folder=ReplicatedStorage:FindFirstChild("Remotes")
+    local remote=folder and folder:FindFirstChild(action.remote)
+    if not remote or not remote:IsA("RemoteEvent") then purchaseStatus("Cash request unavailable");return end
+    action.deadline=now+8
+    purchaseMemory.pending=action
+    local sent,err=pcall(function()remote:FireServer(action.payload)end)
+    if sent then purchaseStatus("Buying "..action.label)
+    else
+        purchaseMemory.pending=nil
+        purchaseMemory.blockedUntilByStamp[PurchasePolicy.key(action)]=now+15
+        warn("[Egg Helper] Cash request: "..tostring(err));purchaseStatus("Request failed")
+    end
+end
+
 local function automationPreview()
+    serviceMemory.placeChoice=state.placeChoice
     local flags={hatch=taskSelected("hatch"),place=taskSelected("place"),equip=taskSelected("equip")}
     local snapshot,context,meta=InventoryRuntime.read(player,serviceMemory,RARITY_RANK,flags)
     local action,reason
     if snapshot and context then action,reason=InventoryPolicy.plan(snapshot,flags,context) end
     local belt=findOwnBelt()
-    return {snapshotReady=snapshot~=nil,planned=action and action.kind,reason=reason or (meta and meta.reason),
+    local cashRows,money=PurchaseRuntime.read(player,purchaseMemory)
+    local cashAction=PurchasePolicy.plan(cashRows,{upgradeEnabled=state.autoUpgrade,buyEnabled=state.autoBuy,targets=state.purchaseTargets},{money=money})
+    return {cashCandidates=cashRows and #cashRows,cashPlanned=cashAction and cashAction.label,snapshotReady=snapshot~=nil,planned=action and action.kind,reason=reason or (meta and meta.reason),
         readyEggAnchors=meta and meta.readyAnchorCount,needsPlotVisit=meta and meta.needsMaintenanceTrip,
         ownTreadmill=belt and belt:GetFullName(),requestsSent=0}
 end
@@ -1348,6 +1623,7 @@ end
 
 lifetime.OnInvoke=function(command)
     if command=="status" then return {auto=state.auto,busy=state.busy,automationBusy=state.automationBusy==true,
+        placeChoice=state.placeChoice,autoUpgrade=state.autoUpgrade,autoBuy=state.autoBuy,
         tasks=table.clone(state.autoTasks),destination=state.destination,movement=state.stopTravel,
         speedMode=state.speedMode,customSpeed=state.customSpeed,drop=state.dropAtPoint,protected=state.protectHeldEgg} end
     if command=="preview" then return automationPreview() end
@@ -1355,10 +1631,12 @@ lifetime.OnInvoke=function(command)
 end
 
 local window = app:CreateWindow({
-    Id="eggs", Title="Egg Helper · v1.8.0", Design="MintGlass",
+    Id="eggs", Title="Egg Helper · v1.9.0", Design="MintGlass",
     Size={640,700}, OpenKey="RightShift", Wallpaper=false, OnClose=cleanup,
 })
 local main=window:AddTab({Title="Main"}):AddSection({Title="Eggs"})
+local eggs=window:AddTab({Title="Egg"}):AddSection({Title="Owned eggs"})
+local shop=window:AddTab({Title="Shop"}):AddSection({Title="Cash purchases"})
 local settings=window:AddTab({Title="Settings"}):AddSection({Title="Return settings"})
 
 local function updateReturnChoice()
@@ -1389,14 +1667,17 @@ speedSlider=main:AddSlider({Id="speed",Title="Tween speed",Min=0,Max=1000,Step=1
     Callback=function(value)state.speedMode,state.customSpeed=UiPolicy.speed(value)end})
 dropAtPointToggle=main:AddToggle({Id="dropAtPoint",Title="Drop at saved point",Default=false,Disabled=true,
     Callback=function(value)state.dropAtPoint=value end})
-main:AddMultiSelect({Id="autoTasks",Title="Auto tasks",Default=table.clone(state.autoTasks),Options={
+local function setAutoTask(key,enabled)
+    local index=table.find(state.autoTasks,key)
+    if enabled and not index then state.autoTasks[#state.autoTasks+1]=key
+    elseif not enabled and index then table.remove(state.autoTasks,index) end
+end
+main:AddMultiSelect({Id="autoTasks",Title="Main tasks",Default={"collect","train"},Options={
     {value="collect",label="Collect eggs"},
     {value="train",label="Train when idle"},
-    {value="hatch",label="Hatch ready eggs"},
-    {value="place",label="Place owned eggs"},
-    {value="equip",label="Equip best"},
 },Callback=function(values)
-    state.autoTasks=table.clone(values)
+    setAutoTask("collect",table.find(values,"collect")~=nil)
+    setAutoTask("train",table.find(values,"train")~=nil)
     if not taskSelected("train") and stopIdleTraining then stopIdleTraining() end
 end})
 autoToggle=main:AddToggle({Id="auto",Title="Auto run",Default=false,Callback=function(value)
@@ -1410,6 +1691,7 @@ autoToggle=main:AddToggle({Id="auto",Title="Auto run",Default=false,Callback=fun
         cancelTween();endHold()
         if stopIdleTraining then stopIdleTraining() end
     end
+    purchaseToggleStatus()
     status(value and "Auto ON." or "Stopped.")
 end})
 main:AddButton({Title="Get egg",Variant="primary",Callback=function()
@@ -1426,6 +1708,44 @@ main:AddButton({Title="Stop",Callback=function()
 end})
 countLabel=main:AddText({Text="Eggs: 0"})
 statusLabel=main:AddText({Text="Status: Ready."})
+
+local lastPlaceOptions
+refreshOwnedEggChoices=function()
+    serviceMemory.placeChoice=state.placeChoice
+    local snapshot=InventoryRuntime.read(player,serviceMemory,RARITY_RANK,{place=false})
+    if not snapshot then return end
+    local options,signature=InventoryPolicy.placementOptions(snapshot,RARITY_RANK,state.placeChoice)
+    if signature~=lastPlaceOptions then
+        placeEggControl:Update({Options=options})
+        lastPlaceOptions=signature
+    end
+end
+eggs:AddText({Text="Runs with Auto run on Main."})
+placeEggControl=eggs:AddDropdown({Id="placeEgg",Title="Egg to place",Default="best",Searchable=true,
+    Options={{value="best",label="Best available"}},Callback=function(value)
+        if state.automationBusy and automationCleanup then automationCleanup() end
+        state.placeChoice=value
+        serviceMemory.placeChoice=value
+        status("Egg selection updated.")
+    end})
+eggs:AddToggle({Id="autoPlace",Title="Auto place selected eggs",Default=taskSelected("place"),Callback=function(value)
+    setAutoTask("place",value)
+    if not value and state.automationBusy and automationCleanup then automationCleanup() end
+end})
+eggs:AddToggle({Id="autoHatch",Title="Auto hatch ready eggs",Default=taskSelected("hatch"),Callback=function(value)setAutoTask("hatch",value)end})
+eggs:AddToggle({Id="autoEquip",Title="Auto equip best",Default=taskSelected("equip"),Callback=function(value)setAutoTask("equip",value)end})
+eggs:AddButton({Title="Refresh eggs",Callback=function()pcall(refreshOwnedEggChoices)end})
+eggStatusLabel=eggs:AddText({Text="Status: Ready."})
+pcall(refreshOwnedEggChoices)
+
+shop:AddText({Text="Cash only. Uses available cash. Requires Auto run."})
+shop:AddMultiSelect({Id="purchaseTargets",Title="Buy / upgrade",Default=table.clone(state.purchaseTargets),Options={
+    {value="cafe",label="Cafe / base"},{value="treadmill",label="Treadmill"},
+    {value="bag",label="Bag capacity"},{value="eggs",label="Egg capacity"},{value="trails",label="Trails"},
+},Callback=function(values)state.purchaseTargets=table.clone(values)end})
+shop:AddToggle({Id="autoUpgrade",Title="Auto upgrade",Default=false,Callback=function(value)state.autoUpgrade=value;purchaseToggleStatus()end})
+shop:AddToggle({Id="autoBuy",Title="Auto buy trails",Default=false,Callback=function(value)state.autoBuy=value;purchaseToggleStatus()end})
+purchaseStatusLabel=shop:AddText({Text="Purchases: OFF"})
 
 settings:AddToggle({Id="protectHeldEgg",Title="Safe return (no held-egg TP)",Default=true,
     Callback=function(value)state.protectHeldEgg=value end})
@@ -1476,11 +1796,14 @@ end)
 
 refreshCount()
 task.spawn(function()
-    local nextCountRefresh=0
+    local nextCountRefresh,nextOwnedRefresh=0,0
     while state.alive do
         if not state.busy then
             state.carryLock=carrying()
             if os.clock()>=nextCountRefresh then refreshCount();nextCountRefresh=os.clock()+1 end
+            if refreshOwnedEggChoices and os.clock()>=nextOwnedRefresh then
+                pcall(refreshOwnedEggChoices);nextOwnedRefresh=os.clock()+2
+            end
             if state.auto then
                 if state.resumeAt>os.clock() then failureStatus()
                 elseif isRagdolled() then status("Recovering from hit…")
@@ -1506,10 +1829,18 @@ task.spawn(function()
                             if automationCleanup then pcall(automationCleanup) end
                         end
                     end
+                    if purchaseStep and not ownedBusy and not state.automationBusy then
+                        local ok,err=pcall(purchaseStep)
+                        if not ok then
+                            warn("[Egg Helper] Cash automation: "..tostring(err))
+                            purchaseMemory.nextAt=os.clock()+5
+                            purchaseStatus("Waiting for shop recovery")
+                        end
+                    end
                     if not ownedBusy then
                         if state.pointPaused then status("At finish. Press Get egg or restart Auto.")
                         elseif taskSelected("collect") and eggReady then runAction(true)
-                        elseif #state.autoTasks==0 then status("Choose an auto task.")
+                        elseif #state.autoTasks==0 and not state.autoUpgrade and not state.autoBuy then status("Choose an auto task.")
                         elseif taskSelected("collect") and not taskSelected("train") then status("Waiting for selected eggs…")
                         elseif not taskSelected("train") then status("Auto ON.") end
                     end
