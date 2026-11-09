@@ -1,4 +1,4 @@
--- Egg helper / Main / Egg / Shop / Settings / optional owned-item tasks (1.9.0).
+-- Egg helper / Main / Egg / Shop / Settings / optional owned-item tasks (1.9.1).
 -- Based on the supplied .rbxl: Runtime.WorldEggs / DroppedEggs,
 -- Rarity / EggId / CarriedBy attributes, and StealPrompt / PickUpPrompt.
 -- Requires a client executor with game:HttpGet and loadstring.
@@ -82,7 +82,7 @@ if old and old:IsA("BindableFunction") and old:GetAttribute("MattEggOwned") then
 end
 
 local state = {
-    alive = true, busy = false, auto = false, epoch = 0, carryLock = false,
+    alive = true, busy = false, auto = false, antiAfk = true, epoch = 0, carryLock = false,
     automationBusy=false, automationRetryAt=0,
     rarities = table.clone(RARITIES), priority = "Highest rarity first", returnMode = "tween", saved = nil,
     placeChoice="best", autoUpgrade=false,autoBuy=false,purchaseTargets={"cafe","treadmill","bag","eggs","trails"},
@@ -101,6 +101,7 @@ local state = {
     skipFastGuards = false, pointPaused = false,
 }
 local app, statusLabel, eggStatusLabel, countLabel, activePrompt, activeTween, autoToggle, speedSlider, returnDelaySlider, returnDistanceSlider
+local antiAfk, antiAfkLabel
 local destinationControl, streamLabel, stopTravelControl, dropAtPointToggle, placeEggControl, purchaseStatusLabel
 local cacheLoadedEggs, resolveEgg, zoneAllowed, streamStep
 local automationStep, automationCleanup, stopIdleTraining, refreshOwnedEggChoices, purchaseStep
@@ -127,6 +128,7 @@ local function cleanup()
     state.alive, state.auto = false, false
     state.epoch = state.epoch + 1
     if automationCleanup then pcall(automationCleanup) end
+    if antiAfk then antiAfk:Cleanup() end
     cancelTween()
     endHold()
     for _, connection in ipairs(connections) do connection:Disconnect() end
@@ -1623,6 +1625,7 @@ end
 
 lifetime.OnInvoke=function(command)
     if command=="status" then return {auto=state.auto,busy=state.busy,automationBusy=state.automationBusy==true,
+        antiAfk=state.antiAfk,antiAfkStatus=antiAfk and antiAfk:GetStatus(),
         placeChoice=state.placeChoice,autoUpgrade=state.autoUpgrade,autoBuy=state.autoBuy,
         tasks=table.clone(state.autoTasks),destination=state.destination,movement=state.stopTravel,
         speedMode=state.speedMode,customSpeed=state.customSpeed,drop=state.dropAtPoint,protected=state.protectHeldEgg} end
@@ -1630,8 +1633,71 @@ lifetime.OnInvoke=function(command)
     cleanup()
 end
 
+local AntiAfk = (function()
+-- Owns only its scoped local idle-method wrapper; never disables other listeners.
+-- deps: clock(), getController(), pulse(), notify(message)?
+local AntiAfk={}
+function AntiAfk.new(deps)
+    local self={alive=true,enabled=false,controller=nil,original=nil,wrapper=nil,lastPulse=-math.huge,pulses=0,lastError=nil}
+    local function notify(message)
+        if deps.notify then pcall(deps.notify,message) end
+    end
+    local function restore()
+        if self.controller and self.controller.GetIdleSeconds==self.wrapper then
+            pcall(function()self.controller.GetIdleSeconds=self.original end)
+        end
+        self.controller,self.original,self.wrapper=nil,nil,nil
+    end
+    local function install()
+        if self.controller and self.controller.GetIdleSeconds==self.wrapper then return true end
+        restore()
+        local ok,controller=pcall(deps.getController)
+        if not ok or type(controller)~="table" or type(controller.GetIdleSeconds)~="function" then return false end
+        local original=controller.GetIdleSeconds
+        local wrapper=function(...)
+            if self.alive and self.enabled then return 0 end
+            return original(...)
+        end
+        local written=pcall(function()controller.GetIdleSeconds=wrapper end)
+        if not written then return false end
+        self.controller,self.original,self.wrapper=controller,original,wrapper
+        return true
+    end
+    function self:SetEnabled(value)
+        self.enabled=self.alive and value==true
+        if self.enabled then
+            local guarded=install()
+            notify(guarded and "ON" or "ON - game idle guard unavailable")
+        else restore();notify("OFF") end
+    end
+    function self:OnIdle()
+        if not self.alive or not self.enabled then return false end
+        local now=deps.clock()
+        if now-self.lastPulse<60 then return false end
+        self.lastPulse=now
+        local guarded=install()
+        local ok,err=pcall(deps.pulse)
+        self.lastError=not ok and tostring(err) or nil
+        if ok then self.pulses+=1 end
+        notify(not ok and "Virtual input unavailable" or guarded and "ON" or "ON - game idle guard unavailable")
+        return ok
+    end
+    function self:GetStatus()
+        return {enabled=self.enabled,gameIdleGuard=self.controller~=nil and self.controller.GetIdleSeconds==self.wrapper,
+            pulses=self.pulses,lastError=self.lastError}
+    end
+    function self:Cleanup()
+        self.enabled,self.alive=false,false
+        restore()
+    end
+    return self
+end
+return AntiAfk
+
+end)()
+
 local window = app:CreateWindow({
-    Id="eggs", Title="Egg Helper · v1.9.0", Design="MintGlass",
+    Id="eggs", Title="Egg Helper · v1.9.1", Design="MintGlass",
     Size={640,700}, OpenKey="RightShift", Wallpaper=false, OnClose=cleanup,
 })
 local main=window:AddTab({Title="Main"}):AddSection({Title="Eggs"})
@@ -1746,6 +1812,29 @@ shop:AddMultiSelect({Id="purchaseTargets",Title="Buy / upgrade",Default=table.cl
 shop:AddToggle({Id="autoUpgrade",Title="Auto upgrade",Default=false,Callback=function(value)state.autoUpgrade=value;purchaseToggleStatus()end})
 shop:AddToggle({Id="autoBuy",Title="Auto buy trails",Default=false,Callback=function(value)state.autoBuy=value;purchaseToggleStatus()end})
 purchaseStatusLabel=shop:AddText({Text="Purchases: OFF"})
+
+antiAfk=AntiAfk.new({clock=os.clock,getController=function()
+    local scripts=player:FindFirstChild("PlayerScripts")
+    local client=scripts and scripts:FindFirstChild("Client")
+    local controllers=client and client:FindFirstChild("Controllers")
+    local target=controllers and controllers:FindFirstChild("AfkController")
+    return target and require(target)
+end,pulse=function()
+    local camera=workspace.CurrentCamera
+    assert(camera,"Camera not ready")
+    local virtualUser=game:GetService("VirtualUser")
+    virtualUser:CaptureController()
+    virtualUser:ClickButton2(Vector2.new(0,0),camera.CFrame)
+end,notify=function(message)
+    if antiAfkLabel then antiAfkLabel:Update({Text="Anti AFK: "..message}) end
+end})
+settings:AddToggle({Id="antiAfk",Title="Anti AFK",Default=state.antiAfk,Callback=function(value)
+    state.antiAfk=value
+    antiAfk:SetEnabled(value)
+end})
+antiAfkLabel=settings:AddText({Text="Anti AFK: ON"})
+connections[#connections+1]=player.Idled:Connect(function()antiAfk:OnIdle()end)
+antiAfk:SetEnabled(state.antiAfk)
 
 settings:AddToggle({Id="protectHeldEgg",Title="Safe return (no held-egg TP)",Default=true,
     Callback=function(value)state.protectHeldEgg=value end})

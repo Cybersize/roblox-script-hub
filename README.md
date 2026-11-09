@@ -30,16 +30,16 @@ The executor must be injected in the current Roblox client. If all HTTP transpor
 
 | Place ID | Script | Features |
 | --- | --- | --- |
-| `129852792970565` | [Egg Collector · Streaming & Recovery](games/129852792970565.luau) | Main / Egg / Shop / Settings; rarity priority, collection, idle training, selective placement, ready hatch, equip best and opt-in cash upgrades |
+| `129852792970565` | [Egg Collector · Streaming & Recovery](games/129852792970565.luau) | Main / Egg / Shop / Settings; rarity priority, collection, idle training, selective placement, ready hatch, equip best, opt-in cash upgrades and Anti AFK |
 | `104432981439032` | [Restaurant Remote Auto Play](games/104432981439032.luau) | Remote-only seat assignment, orders, cooking/collecting, serving, table clearing and dishwashing; no character movement |
 
 **RightShift** hides/shows either menu. The restaurant script starts stopped; press **Start all** to enable its duties. Cooking uses the game's normal timers. Ingredient farming, purchases, spawning customers and staff configuration are not included.
 
-### Egg helper (1.9.0)
+### Egg helper (1.9.1)
 
 The menu is now split into **Main**, **Egg**, **Shop** and **Settings**. Collection is no longer mixed with owned-egg actions or purchases. Streaming and settings-preserving recovery still run automatically without extra configuration pages.
 
-**Quick start:** choose collection rarities on Main, choose owned-egg actions on Egg, then enable **Auto run** on Main. Auto run is the shared master and always starts **OFF**. Purchase switches also start **OFF**, separately. **Stop** cancels all automation and movement. Close the window to unload; **RightShift** hides/shows it without stopping it.
+**Quick start:** choose collection rarities on Main, choose owned-egg actions on Egg, then enable **Auto run** on Main. Auto run is the shared master and always starts **OFF**. Purchase switches also start **OFF**, separately. **Stop** cancels farming, cash automation and movement, but the separate Anti AFK toggle stays active. Close the window to unload everything; **RightShift** hides/shows it without stopping it.
 
 #### Main — collection and movement
 
@@ -76,7 +76,13 @@ No Robux/gamepass/product purchases, Marketplace prompts, hatch skips, selling o
 
 #### Settings and return behavior
 
-Only **Safe return (no held-egg TP)** and timed/near-return sliders remain. Safety defaults **ON**: timed/near/instant choices finish by direct tween while carrying a world egg, not by teleport. Turning it OFF restores experimental carried-egg teleport attempts. A short tween before teleport does not guarantee acceptance.
+**Anti AFK** is **ON by default** and works independently of Auto run. It stays active when farming is stopped. Turning it OFF or closing/unloading restores only the local AFK method owned by this helper and disconnects its own listener; unrelated listeners are not disabled.
+
+The map's AfkController uses GetIdleSeconds to request an automatic AFK rejoin. While enabled, a scoped local wrapper returns zero for that check. Separately, [Roblox's Player.Idled event](https://create.roblox.com/docs/reference/engine/classes/Player#Idled) triggers a paired VirtualUser right-click pulse, throttled to at most once per 60 seconds. No walking, jumping, character teleporting, left-click purchases, AFK remotes or kick hooks are used. It does not start farming or spending. Input failures keep your toggle choice and are reported on Settings instead of silently disabling it.
+
+Virtual input support is executor-dependent. A short accepted API call is not proof of staying connected indefinitely; long-duration idle-disconnect prevention remains unverified.
+
+The other Settings controls are **Safe return (no held-egg TP)** and the timed/near-return sliders. Safety defaults **ON**: timed/near/instant choices finish by direct tween while carrying a world egg, not by teleport. Turning it OFF restores experimental carried-egg teleport attempts. A short tween before teleport does not guarantee acceptance.
 
 Bank finish: `(-208.12997436523438, 4.237678050994873, 399.94561767578125)`.
 Saved drop finish: `(-184.1337127685547, 4.237677097320557, 397.77520751953125)`.
@@ -116,9 +122,11 @@ Game scripts should default to stopped, guard their supported place IDs, stop th
 
 ## Validation status
 
-The current three Luau entry files compile with the official portable Luau CLI. Egg 1.9.0 passes 71 full-source mocked split-UI/selection/purchase-scheduler checks, 39 owned-inventory/selection policy checks, 48 cash-only purchase allowlist checks and 41 idle-training policy checks. Existing suites also cover loader HTTP/fallback behavior (40), selection/recovery (69), streaming/recovery (50), direct return/drop (95), and rarity/config compatibility (16). The old two/five-page UI expectations are superseded, not counted as current coverage.
+The current three Luau entry files compile with the official portable Luau CLI. Egg 1.9.1 passes 80 full-source mocked split-UI/selection/purchase/Anti-AFK integration checks, 19 isolated Anti-AFK ownership/pulse/restoration checks, 39 owned-inventory/selection policy checks, 48 cash-only purchase allowlist checks and 41 idle-training policy checks. Existing suites also cover loader HTTP/fallback behavior (40), selection/recovery (69), streaming/recovery (50), direct return/drop (95), and rarity/config compatibility (16). The old two/five-page UI expectations are superseded, not counted as current coverage.
 
 A live v629 UI-only load confirmed the four-tab layout, native Egg/Shop controls, Auto OFF, both cash switches OFF, readable inventory/native upgrade quotes and no new console errors. The read-only preview sent no gameplay requests. The game window was not focused, so native UI clicks were not performed; mounted controls were verified read-only instead. No cash was spent for testing. Automated purchases, hatch/place/equip requests, treadmill travel, full-region residency, high-speed acceptance and end-to-end protected returns remain unverified live. Client interfaces and offline mocks do not establish server acceptance. Real's checker still reports unresolved game-specific requires and one pre-existing return-state narrowing diagnostic; this is not a claim of a clean type-check.
+
+For 1.9.1, live v630 inspection confirmed the same local AFK rejoin check. A bounded VirtualUser compatibility pulse returned successfully but produced no observed UserInputService input event and did not reset the map's separate idle counter, hence the scoped local game guard. A separate bounded guard test confirmed zero local idle seconds while enabled and exact original-method restoration on OFF/cleanup; the running collector's Auto state stayed unchanged. No farming or purchase requests were sent by those probes. The updated full collector was not reloaded over the user's active farm for this test, and no 20-minute idle soak was performed.
 
 The restaurant's earlier isolated planner/remote-transport checks and read-only task selection remain unchanged; they do not establish acceptance of distant jobs.
 
