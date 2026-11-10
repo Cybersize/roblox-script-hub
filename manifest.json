@@ -13,6 +13,12 @@
       "path": "games/104432981439032.luau",
       "version": "1.1.1",
       "enabled": true
+    },
+    "114861592677288": {
+      "name": "Destroy Grandma - Auto Keys",
+      "path": "games/114861592677288.luau",
+      "version": "1.0.0",
+      "enabled": true
     }
   }
 }

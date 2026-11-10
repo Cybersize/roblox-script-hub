@@ -12,9 +12,9 @@ The loader reads `manifest.json`, detects `game.PlaceId`, and loads only that ga
 
 ### Empty HTTP response / loader 1.1.0
 
-The loader now prefers `request`, `http_request` or `http.request`, falls back to `game:HttpGet`, retries with distinct cache-busting URLs, and can use jsDelivr if GitHub Raw fails. It rejects empty/whitespace, HTML, oversized data and invalid sources rather than executing an empty chunk. Both game scripts receive the same transport for their pinned MattLib dependency.
+The loader now prefers `request`, `http_request` or `http.request`, falls back to `game:HttpGet`, retries with distinct cache-busting URLs, and can use jsDelivr if GitHub Raw fails. It rejects empty/whitespace, HTML, oversized data and invalid sources rather than executing an empty chunk. All game scripts receive the same transport for their pinned MattLib dependency.
 
-An empty manifest no longer blocks the two bundled games, but their script and library files still need a working download. Valid remote disabled/removed entries are respected; the bundled registry is only used when the manifest itself is unavailable/invalid.
+An empty manifest no longer blocks the three bundled games, but their script and library files still need a working download. Valid remote disabled/removed entries are respected; the bundled registry is only used when the manifest itself is unavailable/invalid.
 
 If the initial `game:HttpGet` call also fails, Real supports this request-based bootstrap:
 
@@ -32,6 +32,7 @@ The executor must be injected in the current Roblox client. If all HTTP transpor
 | --- | --- | --- |
 | `129852792970565` | [Egg Collector · Streaming & Recovery](games/129852792970565.luau) | Main / Egg / Shop / Settings; rarity priority, collection, idle training, selective placement, ready hatch, equip best, opt-in cash upgrades and Anti AFK |
 | `104432981439032` | [Restaurant Remote Auto Play](games/104432981439032.luau) | Remote-only seat assignment, orders, cooking/collecting, serving, table clearing and dishwashing; no character movement |
+| `114861592677288` | [Destroy Grandma - Auto Keys](games/114861592677288.luau) | Collect nearest keys and stop at 3/3; Teleport, Tween or Nearby-only movement; no chests or purchases |
 
 **RightShift** hides/shows either menu. The restaurant script starts stopped; press **Start all** to enable its duties. Cooking uses the game's normal timers. Ingredient farming, purchases, spawning customers and staff configuration are not included.
 
@@ -98,6 +99,16 @@ No speed-stat edits, physics flags or anti-caught blocker are included. Safe ret
 
 Restaurant jobs are sent through the game's `Network.Invoke("Entity_Invoke", entityId, method, ...)` transport, which uses a RemoteFunction (`InvokeServer`), not a GUI signal. The script never teleports, walks, changes character physics, or fires proximity prompts. Server validation still applies: if a task requires proximity, its rejection is displayed and backed off; this does not claim to bypass a server distance check.
 
+### Destroy Grandma auto keys (1.0.0)
+
+For place `114861592677288`, based on the supplied Nov 10 snapshot and read-only live version 170. Open Main and enable **Auto collect (stop at 3/3)**. It starts OFF. **Teleport to keys** is the default; choose **Tween to keys** or **Nearby only (no movement)** if preferred. The tween slider is enabled only for Tween. Stop or close the window to cancel movement; RightShift only hides/shows it.
+
+The script reads the replicated `LocalPlayer.Status.Keys.Value`, requires the confirmed Toddler role, a living character and `Status.IsInGame`, and respects the native movement-disabled checks instead of clearing ragdolls/traps. It does not incorrectly require HasJoinedRound or RoundData.IsRound. It searches actual enabled KeyPickupPrompt parts under the current `workspace.Map.Keys` and re-resolves replacement maps.
+
+Pickup uses the same native Warp `PickupKey:Fire(true,key)` payload as KeysHandler, only after arriving within the prompt's five-stud range. It sends one request at a time, waits for a replicated count increase, rechecks the cap/role/map immediately before sending, and backs off unconfirmed keys. A disappearing key alone is not success. Auto switches OFF at **3 or more**, even with the unlimited-keys pass. Already-full starts do not move or request anything. Spending keys afterward does not silently restart collection: enable the toggle again when wanted.
+
+It does **not** open chests, use keys, buy the ExtraKeys pass, change stats or automatically return to the starting point. The third-key finish is wherever that key was collected. The script's direct transport avoids the native full-capacity prompt callback that can offer a paid pass. Server validation still applies; movement/pickup acceptance was not live-tested for this release.
+
 ## Add another game
 
 1. Add its self-contained script as `games/PLACE_ID.luau`.
@@ -122,11 +133,13 @@ Game scripts should default to stopped, guard their supported place IDs, stop th
 
 ## Validation status
 
-The current three Luau entry files compile with the official portable Luau CLI. Egg 1.9.1 passes 80 full-source mocked split-UI/selection/purchase/Anti-AFK integration checks, 19 isolated Anti-AFK ownership/pulse/restoration checks, 39 owned-inventory/selection policy checks, 48 cash-only purchase allowlist checks and 41 idle-training policy checks. Existing suites also cover loader HTTP/fallback behavior (40), selection/recovery (69), streaming/recovery (50), direct return/drop (95), and rarity/config compatibility (16). The old two/five-page UI expectations are superseded, not counted as current coverage.
+The current four Luau entry files compile with the official portable Luau CLI. Egg 1.9.1 passes 80 full-source mocked split-UI/selection/purchase/Anti-AFK integration checks, 19 isolated Anti-AFK ownership/pulse/restoration checks, 39 owned-inventory/selection policy checks, 48 cash-only purchase allowlist checks and 41 idle-training policy checks. Existing suites also cover loader HTTP/fallback behavior (42), selection/recovery (69), streaming/recovery (50), direct return/drop (95), and rarity/config compatibility (16). The old two/five-page UI expectations are superseded, not counted as current coverage.
 
 A live v629 UI-only load confirmed the four-tab layout, native Egg/Shop controls, Auto OFF, both cash switches OFF, readable inventory/native upgrade quotes and no new console errors. The read-only preview sent no gameplay requests. The game window was not focused, so native UI clicks were not performed; mounted controls were verified read-only instead. No cash was spent for testing. Automated purchases, hatch/place/equip requests, treadmill travel, full-region residency, high-speed acceptance and end-to-end protected returns remain unverified live. Client interfaces and offline mocks do not establish server acceptance. Real's checker still reports unresolved game-specific requires and one pre-existing return-state narrowing diagnostic; this is not a claim of a clean type-check.
 
 For 1.9.1, live v630 inspection confirmed the same local AFK rejoin check. A bounded VirtualUser compatibility pulse returned successfully but produced no observed UserInputService input event and did not reset the map's separate idle counter, hence the scoped local game guard. A separate bounded guard test confirmed zero local idle seconds while enabled and exact original-method restoration on OFF/cleanup; the running collector's Auto state stayed unchanged. No farming or purchase requests were sent by those probes. The updated full collector was not reloaded over the user's active farm for this test, and no 20-minute idle soak was performed.
+
+Destroy Grandma 1.0.0 additionally passes 41 full-source mocked collection/movement/pending-request/lifecycle checks and 23 pure cap/role/readiness checks. Real's checker reports zero errors and warnings for the new entry file and wrapper, and all four entry files compile. Snapshot parsing inspected 21,158 instances and 257 serialized scripts without executing saved code (artifact SHA256 5a8050cc11a2c6d2c3ff3a5850f33781f04786978d6365ddc017efca6c8bc3e7). Read-only live v170 checks confirmed the replicated counter, enabled key prompts and native Warp API. No pickup or movement was triggered. The active client switched to another place before UI verification, where the new script correctly exited through its place guard. End-to-end pickups remain unverified.
 
 The restaurant's earlier isolated planner/remote-transport checks and read-only task selection remain unchanged; they do not establish acceptance of distant jobs.
 

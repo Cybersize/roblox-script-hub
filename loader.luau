@@ -8,6 +8,7 @@ local PREFIX = "[Roblox Script Hub] "
 local BUNDLED_GAMES = {
     ["129852792970565"] = {name = "Egg Collector · Streaming & Recovery", path = "games/129852792970565.luau", enabled = true},
     ["104432981439032"] = {name = "Restaurant Remote Auto Play", path = "games/104432981439032.luau", enabled = true},
+    ["114861592677288"] = {name = "Destroy Grandma - Auto Keys", path = "games/114861592677288.luau", enabled = true},
 }
 -- BUNDLED_REGISTRY_END
 
